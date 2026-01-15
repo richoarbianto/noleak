@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "/Users/richoarbianto/Documents/noleak/android/app/src/main/cpp/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/Users/richoarbianto/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/Users/richoarbianto/Documents/noleak/android/app/.cxx/RelWithDebInfo/5bn1z2g3/armeabi-v7a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/Users/richoarbianto/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/Users/richoarbianto/Documents/noleak/android/app/.cxx/RelWithDebInfo/5bn1z2g3/armeabi-v7a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "vault_engine::@6890427a1f51a3e7e1df": {
+      "artifactName": "vault_engine",
+      "abi": "armeabi-v7a",
+      "output": "/Users/richoarbianto/Documents/noleak/build/app/intermediates/cxx/RelWithDebInfo/5bn1z2g3/obj/armeabi-v7a/libvault_engine.so",
+      "runtimeFiles": []
+    }
+  }
+}

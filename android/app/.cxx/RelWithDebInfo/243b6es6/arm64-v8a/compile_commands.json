@@ -1,0 +1,27 @@
+[
+{
+  "directory": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/.cxx/RelWithDebInfo/243b6es6/arm64-v8a",
+  "command": "/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android24 --sysroot=/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -Dvault_engine_EXPORTS -I/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/libsodium/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -O2 -g -DNDEBUG -fPIC -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 -std=gnu11 -o CMakeFiles/vault_engine.dir/vault_engine.c.o -c /Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_engine.c",
+  "file": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_engine.c"
+},
+{
+  "directory": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/.cxx/RelWithDebInfo/243b6es6/arm64-v8a",
+  "command": "/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android24 --sysroot=/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -Dvault_engine_EXPORTS -I/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/libsodium/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -O2 -g -DNDEBUG -fPIC -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 -std=gnu11 -o CMakeFiles/vault_engine.dir/vault_crypto.c.o -c /Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_crypto.c",
+  "file": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_crypto.c"
+},
+{
+  "directory": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/.cxx/RelWithDebInfo/243b6es6/arm64-v8a",
+  "command": "/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android24 --sysroot=/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -Dvault_engine_EXPORTS -I/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/libsodium/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -O2 -g -DNDEBUG -fPIC -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 -std=gnu11 -o CMakeFiles/vault_engine.dir/vault_container.c.o -c /Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_container.c",
+  "file": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_container.c"
+},
+{
+  "directory": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/.cxx/RelWithDebInfo/243b6es6/arm64-v8a",
+  "command": "/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android24 --sysroot=/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -Dvault_engine_EXPORTS -I/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/libsodium/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -O2 -g -DNDEBUG -fPIC -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 -std=gnu11 -o CMakeFiles/vault_engine.dir/vault_index.c.o -c /Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_index.c",
+  "file": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_index.c"
+},
+{
+  "directory": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/.cxx/RelWithDebInfo/243b6es6/arm64-v8a",
+  "command": "/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android24 --sysroot=/Users/richoarbianto/ndk/25.1.8937393/android-ndk-r25b/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -Dvault_engine_EXPORTS -I/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/libsodium/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -O2 -g -DNDEBUG -fPIC -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 -std=gnu11 -o CMakeFiles/vault_engine.dir/vault_jni.c.o -c /Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_jni.c",
+  "file": "/Users/richoarbianto/Documents/Project/noleak/noleak/android/app/src/main/cpp/vault_jni.c"
+}
+]

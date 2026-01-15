@@ -1,0 +1,3 @@
+/Users/richoarbianto/Documents/noleak/android/app/.cxx/RelWithDebInfo/5bn1z2g3/x86/CMakeFiles/vault_engine.dir
+/Users/richoarbianto/Documents/noleak/android/app/.cxx/RelWithDebInfo/5bn1z2g3/x86/CMakeFiles/edit_cache.dir
+/Users/richoarbianto/Documents/noleak/android/app/.cxx/RelWithDebInfo/5bn1z2g3/x86/CMakeFiles/rebuild_cache.dir

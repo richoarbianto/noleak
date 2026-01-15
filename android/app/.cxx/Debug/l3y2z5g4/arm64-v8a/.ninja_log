@@ -1,0 +1,10 @@
+# ninja log v5
+0	86	1767959217246814522	CMakeFiles/vault_engine.dir/vault_engine.c.o	57708d3ad76717d0
+1	93	1767959217254187579	CMakeFiles/vault_engine.dir/vault_crypto.c.o	3f27126a4639e252
+1	98	1767959217259847170	CMakeFiles/vault_engine.dir/vault_jni.c.o	43d05431574b5cc0
+1	121	1767959217282453079	CMakeFiles/vault_engine.dir/vault_index.c.o	479377e3fb2af48
+1	125	1767959217286419164	CMakeFiles/vault_engine.dir/vault_container.c.o	fe4e9d5955687203
+125	171	1767959217330646877	/Users/richoarbianto/Documents/Project/noleak/noleak/build/app/intermediates/cxx/Debug/l3y2z5g4/obj/arm64-v8a/libvault_engine.so	b9b4a961acebf9f6
+1	541	1767963893680665167	CMakeFiles/vault_engine.dir/vault_jni.c.o	43d05431574b5cc0
+542	1024	1767963894126813621	/Users/richoarbianto/Documents/Project/noleak/noleak/build/app/intermediates/cxx/Debug/l3y2z5g4/obj/arm64-v8a/libvault_engine.so	b9b4a961acebf9f6
+0	458	1768128949396110363	/Users/richoarbianto/Documents/Project/noleak/noleak/build/app/intermediates/cxx/Debug/l3y2z5g4/obj/arm64-v8a/libvault_engine.so	b9b4a961acebf9f6
