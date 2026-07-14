@@ -1,0 +1,8 @@
+# Copy to android/key.properties (do not commit) or set NOLEAK_* env vars.
+storeFile=app/your-release-key.jks
+storePassword=
+keyAlias=
+keyPassword=
+
+# Release builds also require:
+# export NOLEAK_SIGNATURE_SHA256=<release signing certificate SHA-256 digest>
