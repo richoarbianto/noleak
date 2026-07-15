@@ -35,6 +35,26 @@ class StreamingImportHandler(private val context: Context) {
     
     private val vaultEngine = VaultEngine.getInstance(context)
     private val safFileHandler = SafFileHandler(context)
+
+    private fun skipFully(input: InputStream, byteCount: Long): Boolean {
+        var remaining = byteCount
+        val discard = ByteArray(64 * 1024)
+        return try {
+            while (remaining > 0) {
+                val skipped = input.skip(remaining)
+                if (skipped > 0) {
+                    remaining -= skipped
+                    continue
+                }
+                val read = input.read(discard, 0, minOf(discard.size.toLong(), remaining).toInt())
+                if (read <= 0) return false
+                remaining -= read
+            }
+            true
+        } finally {
+            secureZeroize(discard)
+        }
+    }
     
     /**
      * Import progress data class
@@ -131,13 +151,13 @@ class StreamingImportHandler(private val context: Context) {
             // Skip to resume position
             if (resumeFromChunk > 0) {
                 val skipBytes = resumeFromChunk.toLong() * StreamingConstants.CHUNK_SIZE
-                var skipped = 0L
-                while (skipped < skipBytes) {
-                    val s = inputStream.skip(skipBytes - skipped)
-                    if (s <= 0) break
-                    skipped += s
+                if (!skipFully(inputStream, skipBytes)) {
+                    vaultEngine.streamingAbort(importId)
+                    emit(ImportProgress(importId, 0, validation.size, 0, totalChunks,
+                        error = "Source file ended before the resume position"))
+                    return@flow
                 }
-                SecureLog.d(TAG, "Skipped $skipped bytes for resume")
+                SecureLog.d(TAG, "Skipped $skipBytes bytes for resume")
             }
             
             // Read and write chunks
@@ -150,7 +170,7 @@ class StreamingImportHandler(private val context: Context) {
                 var bytesRead = 0
                 while (bytesRead < StreamingConstants.CHUNK_SIZE) {
                     val read = inputStream.read(buffer, bytesRead, StreamingConstants.CHUNK_SIZE - bytesRead)
-                    if (read < 0) break
+                    if (read <= 0) break
                     bytesRead += read
                 }
                 
@@ -189,6 +209,13 @@ class StreamingImportHandler(private val context: Context) {
                 emit(ImportProgress(importId, bytesWritten, validation.size, chunkIndex, totalChunks))
             }
 
+            if (chunkIndex != totalChunks || bytesWritten != validation.size) {
+                vaultEngine.streamingAbort(importId)
+                emit(ImportProgress(importId, bytesWritten, validation.size, chunkIndex, totalChunks,
+                    error = "Source file size changed during import"))
+                return@flow
+            }
+
             
             // Finalize import
             SecureLog.d(TAG, "All chunks written, finalizing import... (totalChunks=$totalChunks, bytesWritten=$bytesWritten)")
@@ -223,47 +250,47 @@ class StreamingImportHandler(private val context: Context) {
      * Hash = SHA256(first 1MB || last 1MB || file_size)
      */
     private suspend fun computeSourceHash(uri: Uri, fileSize: Long): ByteArray? = withContext(Dispatchers.IO) {
+        val firstMb = ByteArray(minOf(StreamingConstants.HASH_SAMPLE_SIZE.toLong(), fileSize).toInt())
+        var lastMb: ByteArray? = null
         try {
             val sampleSize = StreamingConstants.HASH_SAMPLE_SIZE.toLong()
-            
-            // Read first 1MB
-            val firstMb = ByteArray(minOf(sampleSize, fileSize).toInt())
-            context.contentResolver.openInputStream(uri)?.use { input ->
+            val firstInput = context.contentResolver.openInputStream(uri) ?: return@withContext null
+            firstInput.use { input ->
                 var read = 0
                 while (read < firstMb.size) {
                     val r = input.read(firstMb, read, firstMb.size - read)
-                    if (r < 0) break
+                    if (r <= 0) break
                     read += r
                 }
-            } ?: return@withContext null
+                if (read != firstMb.size) return@withContext null
+            }
             
-            // Read last 1MB if file is large enough
-            val lastMb: ByteArray? = if (fileSize > sampleSize * 2) {
+            if (fileSize > sampleSize * 2) {
                 val lastBuffer = ByteArray(sampleSize.toInt())
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    input.skip(fileSize - sampleSize)
+                lastMb = lastBuffer
+                val lastInput = context.contentResolver.openInputStream(uri)
+                    ?: return@withContext null
+                lastInput.use { input ->
+                    if (!skipFully(input, fileSize - sampleSize)) {
+                        return@withContext null
+                    }
                     var read = 0
                     while (read < lastBuffer.size) {
                         val r = input.read(lastBuffer, read, lastBuffer.size - read)
-                        if (r < 0) break
+                        if (r <= 0) break
                         read += r
                     }
+                    if (read != lastBuffer.size) return@withContext null
                 }
-                lastBuffer
-            } else {
-                null
             }
-            
-            val hash = vaultEngine.streamingComputeSourceHash(firstMb, lastMb, fileSize)
-            
-            // SECURITY: Zeroize sample buffers
-            secureZeroize(firstMb)
-            if (lastMb != null) secureZeroize(lastMb)
-            
-            hash
+
+            vaultEngine.streamingComputeSourceHash(firstMb, lastMb, fileSize)
         } catch (e: Exception) {
             SecureLog.e(TAG, "Failed to compute source hash: ${e.message}")
             null
+        } finally {
+            secureZeroize(firstMb)
+            secureZeroize(lastMb)
         }
     }
     

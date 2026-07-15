@@ -299,6 +299,12 @@ int vault_delete_file(const uint8_t file_id[VAULT_ID_LEN]) {
   if (found_idx < 0)
     return VAULT_ERR_NOT_FOUND;
 
+  uint32_t old_count = g_vault.entry_count;
+  vault_entry_t *backup_entries = NULL;
+  int result = clone_entries(g_vault.entries, old_count, &backup_entries);
+  if (result != VAULT_OK)
+    return result;
+
   // PERFORMANCE OPTIMIZATION: Soft delete - remove from index only
   // Data blob remains orphaned (will be reclaimed by vault_compact)
   // This is O(1) instead of O(n)
@@ -331,10 +337,17 @@ int vault_delete_file(const uint8_t file_id[VAULT_ID_LEN]) {
   }
 
   // Save only index section - doesn't load any payloads
-  int result = vault_save_index_only();
+  result = vault_save_index_only();
   if (result != VAULT_OK) {
     LOGE("vault_delete_file: vault_save_index_only failed with %d", result);
+    free_entries_array(g_vault.entries, g_vault.entry_count);
+    g_vault.entries = backup_entries;
+    g_vault.entry_count = old_count;
+    backup_entries = NULL;
   }
+
+  if (backup_entries)
+    free_entries_array(backup_entries, old_count);
 
   return result;
 }
@@ -374,10 +387,17 @@ int vault_rename_file(const uint8_t file_id[VAULT_ID_LEN],
     return VAULT_ERR_INVALID_PARAM;
   }
 
+  uint32_t entry_count = g_vault.entry_count;
+  vault_entry_t *backup_entries = NULL;
+  int result = clone_entries(g_vault.entries, entry_count, &backup_entries);
+  if (result != VAULT_OK)
+    return result;
+
   // PERFORMANCE OPTIMIZATION: Update name in-place, then save index only
   // No need to load all payloads - O(1) instead of O(n)
   char *new_name_copy = strdup(new_name);
   if (!new_name_copy) {
+    free_entries_array(backup_entries, entry_count);
     return VAULT_ERR_MEMORY;
   }
 
@@ -390,10 +410,16 @@ int vault_rename_file(const uint8_t file_id[VAULT_ID_LEN],
   g_vault.entries[found_idx].name = new_name_copy;
 
   // Save only index section - doesn't load any payloads
-  int result = vault_save_index_only();
+  result = vault_save_index_only();
   if (result != VAULT_OK) {
     LOGE("vault_rename_file: vault_save_index_only failed with %d", result);
+    free_entries_array(g_vault.entries, g_vault.entry_count);
+    g_vault.entries = backup_entries;
+    backup_entries = NULL;
   }
+
+  if (backup_entries)
+    free_entries_array(backup_entries, entry_count);
 
   return result;
 }

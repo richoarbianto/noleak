@@ -19,6 +19,8 @@ class VaultBridge private constructor(private val context: Context) {
     private val mutex = Mutex()
     
     companion object {
+        private const val MAX_IN_MEMORY_FILE_SIZE = 64L * 1024 * 1024
+
         @Volatile
         private var instance: VaultBridge? = null
         
@@ -260,58 +262,63 @@ class VaultBridge private constructor(private val context: Context) {
         }
         
         mutex.withLock {
-            // Try regular read first
+            val entry = vaultEngine.listFiles().getOrNull()
+                ?.firstOrNull { it.fileId.contentEquals(fileId) }
+                ?: return@withLock Result.failure(
+                    VaultException("File not found", VaultEngine.VAULT_ERR_NOT_FOUND)
+                )
+            if (entry.size > MAX_IN_MEMORY_FILE_SIZE || entry.size > Int.MAX_VALUE) {
+                return@withLock Result.failure(
+                    VaultException(
+                        "File is too large for an in-memory viewer; use a streaming viewer",
+                        VaultEngine.VAULT_ERR_INVALID_PARAM
+                    )
+                )
+            }
+
             val result = vaultEngine.readFile(fileId)
             if (result.isSuccess) {
                 return@withLock result
             }
-            
-            // If failed, check if it's a chunked file
-            val entriesResult = vaultEngine.listFiles()
-            if (entriesResult.isFailure) {
-                return@withLock result // Return original error
-            }
-            
-            val entry = entriesResult.getOrNull()
-                ?.firstOrNull { it.fileId.contentEquals(fileId) }
-                ?: return@withLock result // Return original error
             
             // If not chunked, return original error
             if (entry.chunkCount <= 0) {
                 return@withLock result
             }
             
-            // Read all chunks and combine
+            val combined = ByteArray(entry.size.toInt())
             try {
-                val chunks = mutableListOf<ByteArray>()
-                var totalSize = 0
-                
+                var offset = 0
                 for (i in 0 until entry.chunkCount) {
                     val chunkResult = vaultEngine.readChunk(fileId, i)
                     if (chunkResult.isFailure) {
-                        // Zeroize already read chunks
-                        chunks.forEach { VaultEngine.secureZeroize(it) }
+                        VaultEngine.secureZeroize(combined)
                         return@withLock Result.failure(
                             chunkResult.exceptionOrNull() 
                                 ?: VaultException("Failed to read chunk $i", VaultEngine.VAULT_ERR_IO)
                         )
                     }
                     val chunk = chunkResult.getOrThrow()
-                    chunks.add(chunk)
-                    totalSize += chunk.size
-                }
-                
-                // Combine all chunks
-                val combined = ByteArray(totalSize)
-                var offset = 0
-                for (chunk in chunks) {
+                    if (offset + chunk.size > combined.size) {
+                        VaultEngine.secureZeroize(chunk)
+                        VaultEngine.secureZeroize(combined)
+                        return@withLock Result.failure(
+                            VaultException("Invalid chunked file size", VaultEngine.VAULT_ERR_CORRUPTED)
+                        )
+                    }
                     System.arraycopy(chunk, 0, combined, offset, chunk.size)
                     offset += chunk.size
                     VaultEngine.secureZeroize(chunk)
                 }
-                
+                if (offset != combined.size) {
+                    VaultEngine.secureZeroize(combined)
+                    return@withLock Result.failure(
+                        VaultException("Invalid chunked file size", VaultEngine.VAULT_ERR_CORRUPTED)
+                    )
+                }
                 Result.success(combined)
             } catch (e: Exception) {
+                VaultEngine.secureZeroize(combined)
                 Result.failure(VaultException("Failed to read chunked file: ${e.message}", VaultEngine.VAULT_ERR_IO))
             }
         }

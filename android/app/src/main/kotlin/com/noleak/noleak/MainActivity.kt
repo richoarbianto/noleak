@@ -2,6 +2,8 @@ package com.noleak.noleak
 
 import android.content.ComponentCallbacks2
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -33,6 +35,11 @@ import com.noleak.noleak.security.SecureLog
 class MainActivity : FlutterFragmentActivity() {
     
     private var vaultEngine: VaultEngine? = null
+    private val backgroundHandler = Handler(Looper.getMainLooper())
+    private val pickerLockRunnable = Runnable {
+        SecureLog.security("MainActivity", "SAF picker timeout - closing vault")
+        closeVaultSafely()
+    }
     
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,6 +56,7 @@ class MainActivity : FlutterFragmentActivity() {
     
     override fun onResume() {
         super.onResume()
+        backgroundHandler.removeCallbacks(pickerLockRunnable)
         // Re-assert FLAG_SECURE in case it was cleared
         window.setFlags(
             WindowManager.LayoutParams.FLAG_SECURE,
@@ -69,9 +77,15 @@ class MainActivity : FlutterFragmentActivity() {
     override fun onStop() {
         super.onStop()
         if (VaultPlugin.getInstance()?.isAwaitingActivityResult == true) {
-            SecureLog.security("MainActivity", "onStop - SAF picker active, keeping vault open")
+            val timeoutSeconds = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+                .getLong("flutter.idle_timeout_seconds", 30L)
+                .coerceIn(10L, 30L)
+            backgroundHandler.removeCallbacks(pickerLockRunnable)
+            backgroundHandler.postDelayed(pickerLockRunnable, timeoutSeconds * 1000L)
+            SecureLog.security("MainActivity", "onStop - SAF picker active, lock scheduled")
             return
         }
+        backgroundHandler.removeCallbacks(pickerLockRunnable)
         SecureLog.security("MainActivity", "onStop - closing vault for security")
         closeVaultSafely()
     }
@@ -129,6 +143,7 @@ class MainActivity : FlutterFragmentActivity() {
     }
     
     override fun onDestroy() {
+        backgroundHandler.removeCallbacks(pickerLockRunnable)
         // Final cleanup - ensure vault is closed
         closeVaultSafely()
         super.onDestroy()

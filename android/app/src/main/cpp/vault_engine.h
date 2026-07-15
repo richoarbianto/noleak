@@ -266,7 +266,7 @@ int vault_compute_hash(const uint8_t *data, size_t len,
  * @param hash_out Output hash (32 bytes)
  * @return VAULT_OK on success
  */
-int vault_compute_file_hash(int fd, size_t file_size,
+int vault_compute_file_hash(int fd, uint64_t file_size,
                             uint8_t hash_out[VAULT_HASH_LEN]);
 
 /**
@@ -444,6 +444,9 @@ int vault_save_index_only(void);
  */
 int vault_append_entry(const vault_entry_t *new_entry,
                        const vault_payload_t *payload);
+
+int vault_append_entry_from_chunk_dir(const vault_entry_t *new_entry,
+                                      const char *chunk_dir);
 
 // ============================================================================
 // Memory Management

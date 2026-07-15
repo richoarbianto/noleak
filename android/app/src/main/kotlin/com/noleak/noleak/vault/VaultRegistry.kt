@@ -6,6 +6,7 @@ import com.noleak.noleak.security.SecureLog
 import com.noleak.noleak.security.RegistryCrypto
 import org.json.JSONObject
 import java.io.File
+import java.io.RandomAccessFile
 import java.util.UUID
 
 /**
@@ -22,7 +23,7 @@ class VaultRegistry private constructor(private val context: Context) {
         private const val TAG = "VaultRegistry"
         private const val REGISTRY_FILE = "vault_registry.enc"  // Encrypted registry
         private const val LEGACY_REGISTRY_FILE = "vault_registry.json"  // Old plaintext
-        private const val MAX_VAULTS = 10
+        const val MAX_VAULTS = 25
         
         @Volatile
         private var instance: VaultRegistry? = null
@@ -273,27 +274,33 @@ class VaultRegistry private constructor(private val context: Context) {
         // Delete vault file
         val vaultFile = File(vaultDir, vault.filename)
         if (vaultFile.exists()) {
-            // Secure delete - overwrite with random data
             try {
-                vaultFile.outputStream().use { out ->
-                    val buffer = ByteArray(4096)
-                    var remaining = vaultFile.length()
+                val buffer = ByteArray(64 * 1024)
+                val random = java.security.SecureRandom()
+                var remaining = vaultFile.length()
+                RandomAccessFile(vaultFile, "rw").use { file ->
+                    file.seek(0)
                     while (remaining > 0) {
                         val toWrite = minOf(remaining, buffer.size.toLong()).toInt()
-                        java.security.SecureRandom().nextBytes(buffer)
-                        out.write(buffer, 0, toWrite)
+                        random.nextBytes(buffer)
+                        file.write(buffer, 0, toWrite)
                         remaining -= toWrite
                     }
+                    file.fd.sync()
                 }
             } catch (e: Exception) {
                 SecureLog.e(TAG, "Secure overwrite failed: ${e.message}")
+                return false
             }
-            vaultFile.delete()
+            if (!vaultFile.delete()) {
+                SecureLog.e(TAG, "Failed to delete vault file")
+                return false
+            }
         }
         
         // Remove from registry
         vaults.removeIf { it.id == vaultId || it.filename == vault.filename }
-        saveRegistry(vaults)
+        if (!saveRegistry(vaults)) return false
         
         SecureLog.i(TAG, "Deleted vault: $vaultId")
         return true

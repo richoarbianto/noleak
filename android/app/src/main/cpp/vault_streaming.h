@@ -28,6 +28,18 @@ extern "C" {
 #define STREAMING_STATE_VERSION 1
 #define STREAMING_HASH_SAMPLE_SIZE (1024 * 1024)  // 1MB for source hash
 
+static inline int streaming_chunk_plaintext_len(uint64_t file_size,
+                                                uint32_t chunk_size,
+                                                uint32_t chunk_index,
+                                                size_t *len_out) {
+    if (!len_out || file_size == 0 || chunk_size == 0) return 0;
+    uint64_t offset = (uint64_t)chunk_index * chunk_size;
+    if (offset >= file_size) return 0;
+    uint64_t remaining = file_size - offset;
+    *len_out = (size_t)(remaining > chunk_size ? chunk_size : remaining);
+    return 1;
+}
+
 // Streaming import state (persisted to disk for resume)
 typedef struct {
     uint8_t import_id[VAULT_ID_LEN];      // Unique import session ID

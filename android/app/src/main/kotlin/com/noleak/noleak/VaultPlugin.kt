@@ -1627,6 +1627,16 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             fileData?.let { SafFileHandler.secureZeroize(it) }
         }
     }
+
+    private fun hasSupportedVaultMagic(file: File): Boolean {
+        return FileInputStream(file).use { fis ->
+            val magic = ByteArray(7)
+            val read = fis.read(magic)
+            if (read != 7) return@use false
+            val marker = String(magic, Charsets.US_ASCII)
+            marker == "VAULTv1" || marker == "VAULTJ1"
+        }
+    }
     
     private suspend fun importVaultFileFromUri(uri: Uri): Map<String, Any>? {
         val ctx = activity ?: return null
@@ -1689,11 +1699,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             SecureLog.d("VaultPlugin", "importVaultFileFromUri: copy complete, actualSize=$actualSize")
             
             // Validate vault magic
-            val ok = FileInputStream(tempFile).use { fis ->
-                val magic = ByteArray(7)
-                val read = fis.read(magic)
-                read == 7 && String(magic) == "VAULTv1"
-            }
+            val ok = hasSupportedVaultMagic(tempFile)
             if (!ok) {
                 SecureLog.e("VaultPlugin", "importVaultFileFromUri: invalid vault magic")
                 // SECURITY: Secure wipe temp file before deletion
@@ -1822,11 +1828,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             } ?: return null
             
             // Validate vault magic
-            val ok = FileInputStream(tempFile).use { fis ->
-                val magic = ByteArray(7)
-                val read = fis.read(magic)
-                read == 7 && String(magic) == "VAULTv1"
-            }
+            val ok = hasSupportedVaultMagic(tempFile)
             if (!ok) {
                 // SECURITY: Secure wipe temp file before deletion
                 vaultEngine.secureWipeFile(tempFile.absolutePath)
@@ -2286,11 +2288,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             } ?: return false
 
             // Minimal magic check
-            val ok = FileInputStream(tempFile).use { fis ->
-                val magic = ByteArray(7)
-                val read = fis.read(magic)
-                read == 7 && String(magic) == "VAULTv1"
-            }
+            val ok = hasSupportedVaultMagic(tempFile)
             if (!ok) {
                 // SECURITY: Secure wipe temp file before deletion
                 vaultEngine.secureWipeFile(tempFile.absolutePath)
@@ -2470,7 +2468,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             return
         }
         if (!vaultRegistry.canAddVault()) {
-            result.error("MAX_VAULTS", "Maximum 10 vaults allowed", null)
+            result.error("MAX_VAULTS", "Maximum 25 vaults allowed", null)
             return
         }
         
@@ -2558,7 +2556,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             return
         }
         if (!vaultRegistry.canAddVault()) {
-            result.error("MAX_VAULTS", "Maximum 10 vaults allowed", null)
+            result.error("MAX_VAULTS", "Maximum 25 vaults allowed", null)
             return
         }
 
@@ -2589,7 +2587,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
 
     private fun handleImportVaultFile(result: MethodChannel.Result) {
         if (!vaultRegistry.canAddVault()) {
-            result.error("MAX_VAULTS", "Maximum 10 vaults allowed", null)
+            result.error("MAX_VAULTS", "Maximum 25 vaults allowed", null)
             return
         }
 
@@ -2611,7 +2609,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
     // 2-step import: Step 1 - Pick file only (returns URI string)
     private fun handlePickVaultFile(result: MethodChannel.Result) {
         if (!vaultRegistry.canAddVault()) {
-            result.error("MAX_VAULTS", "Maximum 10 vaults allowed", null)
+            result.error("MAX_VAULTS", "Maximum 25 vaults allowed", null)
             return
         }
 
@@ -2642,7 +2640,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         }
 
         if (!vaultRegistry.canAddVault()) {
-            result.error("MAX_VAULTS", "Maximum 10 vaults allowed", null)
+            result.error("MAX_VAULTS", "Maximum 25 vaults allowed", null)
             return
         }
 
@@ -2676,6 +2674,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         }
 
         scope.launch {
+            var closeWhenDone = false
             try {
                 // Check if the requested vault is already open
                 val vaultEngine = VaultEngine.getInstance(activity!!)
@@ -2692,11 +2691,13 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                         result.error("AUTH_FAILED", "Incorrect password", null)
                         return@launch
                     }
+                    closeWhenDone = true
                 }
                 
                 // Find the title file
                 val files = vaultBridge.listFiles().getOrNull()
                 val titleEntry = files?.find { it.name == "__vault_title__" }
+                    ?: files?.find { it.name == "__vault_title__.tmp" }
                 
                 val title = if (titleEntry != null) {
                     val titleData = vaultBridge.readFile(titleEntry.fileId).getOrNull()
@@ -2706,14 +2707,11 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                     ""
                 }
                 
-                // Only close if we opened it ourselves
-                if (!isAlreadyOpen) {
-                    vaultBridge.closeVault()
-                }
-                
                 result.success(title)
             } catch (e: Exception) {
                 result.error("READ_FAILED", e.message, null)
+            } finally {
+                if (closeWhenDone) vaultBridge.closeVault()
             }
         }
     }
@@ -2735,6 +2733,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         }
 
         scope.launch {
+            var closeWhenDone = false
             try {
                 // Check if the requested vault is already open
                 val vaultEngine = VaultEngine.getInstance(activity!!)
@@ -2752,30 +2751,51 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                         result.error("AUTH_FAILED", "Incorrect password", null)
                         return@launch
                     }
+                    closeWhenDone = true
                 }
                 
-                // Find and delete existing title
-                val files = vaultBridge.listFiles().getOrNull()
-                val titleEntry = files?.find { it.name == "__vault_title__" }
-                if (titleEntry != null) {
-                    vaultBridge.deleteFile(titleEntry.fileId)
+                val files = vaultBridge.listFiles().getOrThrow()
+                var titleEntry = files.find { it.name == "__vault_title__" }
+                val pendingTitle = files.find { it.name == "__vault_title__.tmp" }
+                if (titleEntry == null && pendingTitle != null) {
+                    if (vaultBridge.renameFile(pendingTitle.fileId, "__vault_title__").isFailure) {
+                        result.error("UPDATE_FAILED", "Failed to recover pending title", null)
+                        return@launch
+                    }
+                    titleEntry = pendingTitle
+                } else if (pendingTitle != null &&
+                    vaultBridge.deleteFile(pendingTitle.fileId).isFailure) {
+                    result.error("UPDATE_FAILED", "Failed to remove stale title update", null)
+                    return@launch
                 }
-                
-                // Store new title - use type 1 (TEXT)
+
                 val titleData = newTitle.toByteArray(Charsets.UTF_8)
-                val importResult = vaultBridge.importFile(titleData, 1, "__vault_title__", "text/plain")
-                if (importResult.isFailure) {
-                    SecureLog.e("VaultPlugin", "Failed to save new title")
+                val importResult = try {
+                    vaultBridge.importFile(titleData, 1, "__vault_title__.tmp", "text/plain")
+                } finally {
+                    VaultEngine.secureZeroize(titleData)
                 }
-                
-                // Only close if we opened it ourselves
-                if (!isAlreadyOpen) {
-                    vaultBridge.closeVault()
+                if (importResult.isFailure) {
+                    result.error("UPDATE_FAILED", "Failed to save new title", null)
+                    return@launch
+                }
+
+                if (titleEntry != null && vaultBridge.deleteFile(titleEntry.fileId).isFailure) {
+                    result.error("UPDATE_FAILED", "Failed to replace old title", null)
+                    return@launch
+                }
+
+                val tempId = importResult.getOrThrow()
+                if (vaultBridge.renameFile(tempId, "__vault_title__").isFailure) {
+                    result.error("UPDATE_FAILED", "Failed to commit new title", null)
+                    return@launch
                 }
                 
                 result.success(true)
             } catch (e: Exception) {
                 result.error("UPDATE_FAILED", e.message, null)
+            } finally {
+                if (closeWhenDone) vaultBridge.closeVault()
             }
         }
     }
@@ -2798,6 +2818,26 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             return
         }
 
+        if (passwordRateLimiter.isLockedOut(vaultId)) {
+            val remainingSecs = passwordRateLimiter.getRemainingLockoutMs(vaultId) / 1000
+            result.error(
+                "RATE_LIMITED",
+                "Too many attempts. Try again in ${remainingSecs}s",
+                mapOf("remainingSeconds" to remainingSecs)
+            )
+            return
+        }
+        val backoffMs = passwordRateLimiter.getBackoffMs(vaultId)
+        if (backoffMs > 0) {
+            val remainingSecs = backoffMs / 1000
+            result.error(
+                "RATE_LIMITED",
+                "Wait ${remainingSecs}s before next attempt",
+                mapOf("remainingSeconds" to remainingSecs)
+            )
+            return
+        }
+
         scope.launch {
             val wasOpenTarget = currentVaultId == vaultId && vaultBridge.isVaultOpen()
             if (!wasOpenTarget && vaultBridge.isVaultOpen()) {
@@ -2808,8 +2848,21 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 vaultBridge.closeVault()
             }
             if (!verified) {
-                passwordRateLimiter.recordFailure(vaultId)
-                result.error("AUTH_FAILED", "Incorrect password", null)
+                val remaining = passwordRateLimiter.recordFailure(vaultId)
+                if (remaining == -1) {
+                    val remainingSecs = passwordRateLimiter.getRemainingLockoutMs(vaultId) / 1000
+                    result.error(
+                        "RATE_LIMITED",
+                        "Too many attempts. Try again in ${remainingSecs}s",
+                        mapOf("remainingSeconds" to remainingSecs)
+                    )
+                } else {
+                    result.error(
+                        "AUTH_FAILED",
+                        "Incorrect password. $remaining attempts remaining",
+                        mapOf("attemptsRemaining" to remaining)
+                    )
+                }
                 return@launch
             }
             passwordRateLimiter.recordSuccess(vaultId)

@@ -408,6 +408,8 @@ class _UnlockVaultScreenMultiState extends State<UnlockVaultScreenMulti> {
       _error = null;
     });
 
+    var vaultOpened = false;
+    var unlockCompleted = false;
     try {
       SecureLogger.d('UnlockVault', 'Opening vault ${widget.vaultId}');
 
@@ -415,6 +417,7 @@ class _UnlockVaultScreenMultiState extends State<UnlockVaultScreenMulti> {
         vaultId: widget.vaultId,
         password: _passphraseController.text,
       );
+      vaultOpened = true;
       SecureLogger.d('UnlockVault', 'Vault opened successfully');
 
       SecurePassphrase.clearController(_passphraseController);
@@ -426,13 +429,13 @@ class _UnlockVaultScreenMultiState extends State<UnlockVaultScreenMulti> {
       SecureLogger.d('UnlockVault', 'Biometric result: $biometricSuccess');
 
       if (!biometricSuccess) {
-        await VaultChannel.closeVault();
         throw Exception('Biometric authentication required');
       }
       await VaultChannel.recordAuthSuccess(vaultId: widget.vaultId);
 
       SecureLogger.d('UnlockVault', 'Calling unlockVaultById...');
       await widget.stateManager.unlockVaultById(widget.vaultId);
+      unlockCompleted = true;
       SecureLogger.d(
           'UnlockVault', 'State is now: ${widget.stateManager.state}');
     } catch (e) {
@@ -446,6 +449,13 @@ class _UnlockVaultScreenMultiState extends State<UnlockVaultScreenMulti> {
         }
       });
     } finally {
+      if (vaultOpened && !unlockCompleted) {
+        try {
+          await VaultChannel.closeVault();
+        } catch (e) {
+          SecureLogger.e('UnlockVault', 'Failed to close vault', e);
+        }
+      }
       if (mounted) {
         setState(() {
           _isLoading = false;

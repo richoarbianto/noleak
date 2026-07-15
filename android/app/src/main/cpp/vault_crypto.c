@@ -189,14 +189,14 @@ int vault_compute_hash(const uint8_t *data, size_t len,
 
 // Compute SHA256 hash of file (excluding last 32 bytes which is the hash
 // itself)
-int vault_compute_file_hash(int fd, size_t file_size,
+int vault_compute_file_hash(int fd, uint64_t file_size,
                             uint8_t hash_out[VAULT_HASH_LEN]) {
   if (fd < 0 || file_size <= VAULT_HASH_LEN || !hash_out) {
     return VAULT_ERR_INVALID_PARAM;
   }
 
   // Hash everything except the last 32 bytes (the hash itself)
-  size_t hash_data_len = file_size - VAULT_HASH_LEN;
+  uint64_t hash_data_len = file_size - VAULT_HASH_LEN;
 
   // Seek to beginning
   if (lseek(fd, 0, SEEK_SET) != 0) {
@@ -207,10 +207,11 @@ int vault_compute_file_hash(int fd, size_t file_size,
   crypto_hash_sha256_init(&state);
 
   uint8_t buffer[64 * 1024];
-  size_t remaining = hash_data_len;
+  uint64_t remaining = hash_data_len;
 
   while (remaining > 0) {
-    size_t to_read = (remaining > sizeof(buffer)) ? sizeof(buffer) : remaining;
+    size_t to_read =
+        remaining > sizeof(buffer) ? sizeof(buffer) : (size_t)remaining;
     ssize_t read_len = read(fd, buffer, to_read);
     if (read_len <= 0) {
       return VAULT_ERR_IO;
@@ -248,13 +249,14 @@ int vault_secure_wipe_file(const char *path) {
     return VAULT_ERR_IO;
   }
 
-  size_t file_size = st.st_size;
+  uint64_t file_size = (uint64_t)st.st_size;
   uint8_t buffer[64 * 1024];
-  size_t remaining = file_size;
+  uint64_t remaining = file_size;
 
   // Overwrite with random data
   while (remaining > 0) {
-    size_t to_write = (remaining > sizeof(buffer)) ? sizeof(buffer) : remaining;
+    size_t to_write =
+        remaining > sizeof(buffer) ? sizeof(buffer) : (size_t)remaining;
     randombytes_buf(buffer, to_write);
     if (write(fd, buffer, to_write) != (ssize_t)to_write) {
       close(fd);

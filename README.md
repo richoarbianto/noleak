@@ -5,11 +5,11 @@
 </p>
 
 <p align="center">
-  <strong>Offline encrypted vault for Android</strong>
+  <strong>Local-first encrypted file vault for Android</strong>
 </p>
 
 <p align="center">
-  NoLeak stores files in a local encrypted container. It is built with Flutter, Kotlin, native C, and libsodium.
+  NoLeak keeps files inside encrypted containers on the device. It is built with Flutter, Kotlin, native C, and libsodium, and the Android app explicitly excludes internet access.
 </p>
 
 <p align="center">
@@ -30,65 +30,116 @@
 
 ## Status
 
-NoLeak is an Android-only encrypted vault project under active development. The current app version is `1.0.0`.
+NoLeak is an Android-only project under active development. The current application version is `1.0.0` (`versionCode 1000`) and requires Android 7.0/API 24 or newer.
 
-Use the latest GitHub release for packaged APK builds:
+Packaged releases are available from [GitHub Releases](https://github.com/richoarbianto/noleak/releases/latest).
 
-[https://github.com/richoarbianto/noleak/releases/latest](https://github.com/richoarbianto/noleak/releases/latest)
-
-NoLeak does not provide cloud sync, server-side recovery, or passphrase reset. If a vault passphrase is lost, the vault content cannot be recovered by the app.
+NoLeak has no cloud sync, remote account, server-side recovery, or passphrase reset. Losing a vault passphrase means losing access to that vault.
 
 ## Features
 
-- Multiple independent vaults.
-- File import through Android Storage Access Framework.
-- Folder organization inside the vault.
-- Encrypted vault export and import for backup/restore workflows.
-- In-app viewers for images, text, PDF, Office documents, audio, and video.
-- PDF preview rendered through Android native PDF rendering without writing plaintext PDF files to app cache.
-- Streaming import path for large files.
-- Secure on-screen keyboard for passphrase input.
-- Configurable app lock and vault auto-lock behavior.
+### Vault management
 
-## Supported file types
+- Create and manage up to 25 independent vaults.
+- Assign a private title to each vault.
+- Change a vault passphrase after verifying the current one.
+- Export an encrypted vault container for backup and import it later.
+- Delete a vault with password verification, rate limiting, best-effort overwrite, and registry cleanup.
+- Show the encrypted container size for each vault on the dashboard.
+
+### File and folder management
+
+- Import individual files through Android's Storage Access Framework (SAF).
+- Recursively import folders while preserving their relative structure.
+- Create virtual folders inside a vault.
+- Search, rename, move, copy, export, and delete files.
+- Rename or recursively delete folders and their contents.
+- Export individual files as plaintext only after an explicit warning; encrypted vault export remains a separate workflow.
+
+### Secure previews and playback
+
+- Image viewer for supported image formats.
+- Bounded text and key-file previews.
+- PDF pages rendered through Android's native PDF renderer without creating a plaintext PDF cache file.
+- Text extraction previews for DOCX, XLSX, and PPTX with archive, entry-size, and output limits.
+- Audio and video playback backed by vault-aware Android media data sources.
+- Decrypted buffers and media sessions are cleared when viewers close or the vault locks.
+
+### Large-file handling
+
+- Files larger than 10 MiB use the resumable streaming import path.
+- Streaming imports support files up to 50 GiB.
+- Source sampling, exact resume offsets, ordered chunk validation, and final byte-count checks prevent resuming from the wrong position.
+- Encryption and final container commit use bounded buffers instead of materializing the complete file in RAM.
+- Interrupted encrypted chunks can be resumed after the user selects the same source again.
+
+### Locking and authentication
+
+- Vault unlock requires both the vault passphrase and biometric authentication.
+- Optional biometric app lock can protect application launch separately from vault unlock.
+- Configurable idle auto-lock: 10, 15, 20, or 30 seconds.
+- Configurable biometric session re-authentication: 3, 5, or 10 minutes.
+- Secure on-screen keyboard is enabled by default and can be disabled in settings.
+- Progressive password backoff and lockout protect vault opening and deletion.
+
+## Supported imports
+
+Import validation currently accepts the following MIME types:
 
 | Category | Formats |
 | --- | --- |
-| Images | JPEG, PNG, GIF, WebP |
-| Video | MP4, MKV, WebM and other device-supported media formats |
-| Audio | MP3, M4A, AAC, WAV, OGG/OPUS, FLAC |
+| Images | JPEG, PNG, WebP |
+| Video | MP4, MKV |
+| Audio | MP3, M4A/MP4 audio, AAC, WAV, OGG, OPUS, FLAC |
 | Documents | PDF, DOCX, XLSX, PPTX |
-| Text | Plain text and common key/text formats |
+| Text and keys | TXT, PEM, SSH public keys, PGP/ASC, PKCS#8 |
 
-Actual playback support also depends on Android device codec support.
+Playback and rendering still depend on Android device codec and platform support.
+
+## Operational limits
+
+| Limit | Current value |
+| --- | --- |
+| Vaults per installation | 25 |
+| Maximum imported file size | 50 GiB |
+| Streaming import threshold | More than 10 MiB |
+| Whole-file in-memory viewer limit | 64 MiB |
+| Office preview output | 200,000 characters |
+
+Video and PDF use streaming/page-based paths. Image, Office, and audio flows that require a complete in-memory buffer reject files above the 64 MiB viewer limit instead of risking an out-of-memory crash.
+
+Streaming import is memory-bounded, but its crash-safe final commit uses both encrypted pending chunks and an atomic temporary container. Before importing a file of size `N`, plan for roughly `current vault size + 2N` of free storage at peak.
 
 ## Security model
 
-NoLeak is designed to protect vault contents while the vault is locked and the encrypted container remains intact. The app focuses on local-only storage and defense-in-depth on Android.
+NoLeak protects data at rest while the vault is locked and the encrypted container remains intact. It uses local cryptography as the primary boundary and Android runtime checks as defense in depth.
 
-Implemented protections include:
+Implemented controls include:
 
-- no Android internet permission in the application manifest;
+- no Android `INTERNET` permission;
+- Android backup and data extraction disabled;
 - XChaCha20-Poly1305 authenticated encryption through libsodium;
-- Argon2id passphrase-based key derivation;
-- per-file data encryption keys wrapped by a vault master key;
-- Android Keystore integration for biometric-gated unlock flows;
-- progressive password rate limiting;
-- auto-lock on background/lifecycle events;
-- Android `FLAG_SECURE` to reduce screen capture exposure;
-- root, debugger, emulator, ADB, install-source, and signature checks before vault operations;
-- debug-only logging wrappers intended to avoid sensitive logs in release builds.
+- Argon2id passphrase derivation with device-adaptive memory parameters;
+- a random vault master key wrapped by the passphrase-derived key;
+- a separate random data-encryption key for each file, wrapped by the vault master key;
+- an authenticated encrypted index plus a SHA-256 container integrity hash;
+- Android Keystore and AndroidX Biometric integration for biometric-gated flows;
+- password backoff and lockout for brute-force resistance;
+- lifecycle, idle, and session locking with native key cleanup;
+- Android `FLAG_SECURE` to reduce screenshots and screen recording;
+- fail-closed checks for root/Magisk artifacts, Frida/hooking, debuggers, tracing, ADB, emulators, bootloader state, install source, build tags, and signing certificate;
+- release minification and debug-only logging wrappers intended to avoid sensitive production logs.
 
-Runtime environment checks are a defense-in-depth layer. They are not a replacement for strong cryptography, safe passphrases, or secure device handling.
+Runtime tamper checks can produce device-specific compatibility failures and cannot make a compromised operating system trustworthy. They do not replace strong passphrases, current Android security updates, or safe device handling. Secure deletion on flash storage is best effort because wear leveling can retain physical copies outside application control.
 
-## Cryptography overview
+## Cryptography and container format
 
 ```text
 Passphrase
-  └─ Argon2id + random salt → KEK
-       └─ unwrap encrypted master key
-            └─ unwrap per-file DEK
-                 └─ decrypt encrypted file chunks
+  └─ Argon2id + random salt → key-encryption key (KEK)
+       └─ unwrap random vault master key
+            └─ unwrap per-file data-encryption key (DEK)
+                 └─ decrypt authenticated file data/chunks
 ```
 
 | Area | Implementation |
@@ -96,8 +147,12 @@ Passphrase
 | Content encryption | XChaCha20-Poly1305 |
 | Key derivation | Argon2id |
 | Randomness | libsodium CSPRNG |
+| Container index | Authenticated encryption with file/chunk offsets and metadata |
+| Container integrity | SHA-256 over container contents |
 | Registry metadata | Android Keystore-backed encryption |
 | Biometrics | AndroidX Biometric / Android Keystore |
+
+The native container stores its header, wrapped master key, encrypted index, and encrypted payloads in one file. Metadata-only changes use atomic temporary-file replacement and only update in-memory offsets after the new container is durable. `VAULTv1` is the current format; legacy `VAULTJ1` containers are accepted and migrated to the current layout when opened successfully.
 
 ## Project layout
 
@@ -105,25 +160,26 @@ Passphrase
 lib/
   main.dart                         Flutter application entry point
   models/                           Vault and file metadata models
-  screens/                          Dashboard, unlock, vault, and viewer screens
-  services/                         Dart state management and native channel API
+  screens/                          Dashboard, file manager, settings, and viewers
+  services/                         Dart state, settings, progress, and native channel APIs
   widgets/                          Secure keyboard and reusable UI components
   utils/                            Logging and passphrase helpers
 
 android/app/src/main/kotlin/
   com/noleak/noleak/MainActivity.kt Android lifecycle and window hardening
   com/noleak/noleak/VaultPlugin.kt  Flutter ↔ Android MethodChannel boundary
-  com/noleak/noleak/security/       Environment checks, Keystore, rate limiting
-  com/noleak/noleak/vault/          Kotlin vault bridge and SAF handling
-  com/noleak/noleak/audio|video/    Media playback adapters
+  com/noleak/noleak/security/       Environment checks, Keystore, and rate limiting
+  com/noleak/noleak/vault/          Vault bridge, registry, SAF, and streaming import
+  com/noleak/noleak/audio|video/    Vault-aware media playback adapters
 
 android/app/src/main/cpp/
-  vault_crypto.c                    libsodium crypto wrappers
-  vault_container.c                 vault container read/write logic
-  vault_engine.c                    global vault state and lifecycle
-  vault_index.c                     encrypted index serialization
-  vault_streaming.c                 streaming import state machine
-  vault_jni.c                       JNI bindings
+  vault_crypto.c                    libsodium crypto and file-wipe wrappers
+  vault_container.c                 Container read/write and atomic commit logic
+  vault_engine.c                    Global native vault state and lifecycle
+  vault_index.c                     File operations and encrypted index handling
+  vault_streaming.c                 Resumable chunk encryption and finalization
+  vault_jni.c                       Core JNI bindings
+  vault_streaming_jni.c             Streaming JNI bindings
 ```
 
 ## Build from source
@@ -131,26 +187,24 @@ android/app/src/main/cpp/
 Requirements:
 
 - Flutter SDK compatible with Dart `^3.5.2`.
-- Android SDK.
+- Android SDK with compile SDK 35.
 - Android NDK `25.1.8937393`.
-- JDK 17. Android Studio's bundled JBR is recommended.
+- CMake 3.22.1.
+- JDK 17; Android Studio's bundled JBR is recommended.
 
-If your shell uses a newer JDK by default:
-
-```bash
-export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
-```
-
-Development build:
+Fetch packages and run local checks:
 
 ```bash
 flutter pub get
-flutter run
+flutter analyze lib
+flutter test
 ```
+
+Debug builds compile, but runtime security checks intentionally reject debuggable packages. Use a correctly signed release build to exercise the complete vault flow on a supported physical device.
 
 ## Release build
 
-Release builds require local signing configuration. Create `android/key.properties` or provide equivalent environment variables:
+Release builds require a private signing key and an explicit certificate allowlist. Create `android/key.properties` or provide the equivalent `NOLEAK_*` environment variables:
 
 ```properties
 storeFile=app/your-release-key.jks
@@ -159,45 +213,37 @@ keyAlias=...
 keyPassword=...
 ```
 
-Set the expected release certificate SHA-256 digest:
+Set `NOLEAK_SIGNATURE_SHA256` to the uppercase 64-character SHA-256 digest of the release signing certificate, without colon separators. Multiple accepted certificates can be comma-separated.
 
 ```bash
-export NOLEAK_SIGNATURE_SHA256="AA11BB22..."
-```
-
-Then build the general release APK:
-
-```bash
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+export NOLEAK_SIGNATURE_SHA256="AABBCCDD..."
 flutter build apk --release
 ```
 
-Output:
+Release APK output:
 
 ```text
 build/app/outputs/flutter-apk/app-release.apk
 ```
 
-Do not commit keystores, signing passwords, or `android/key.properties`.
-
-## Verification
-
-Useful local checks before release:
+Recommended artifact verification:
 
 ```bash
-flutter analyze
-flutter test
-flutter build apk --release
+apksigner verify --verbose --print-certs build/app/outputs/flutter-apk/app-release.apk
+shasum -a 256 build/app/outputs/flutter-apk/app-release.apk
 ```
 
-Analyzer warnings should be reviewed. Build failures should block release.
+Never commit keystores, signing passwords, `android/key.properties`, or environment files containing release credentials.
 
 ## Security contribution rules
 
-- Do not add network access unless the threat model and README are updated.
-- Do not log passphrases, keys, decrypted file bytes, vault plaintext, or full sensitive paths.
-- Avoid plaintext temporary files. If a temporary file is unavoidable, document the lifecycle and cleanup.
-- Keep vault format changes backwards-compatible or provide an explicit migration.
-- Treat runtime tamper checks as defense-in-depth, not as the primary security boundary.
+- Do not add network access unless the threat model and this README are updated.
+- Do not log passphrases, keys, decrypted bytes, vault plaintext, or full sensitive paths.
+- Avoid plaintext temporary files. If one is unavoidable, document its lifecycle and cleanup.
+- Keep vault format changes backward-compatible or provide an explicit migration.
+- Preserve fail-closed behavior at authentication, environment, and persistence boundaries.
+- Treat runtime tamper checks as defense in depth, not as the primary security boundary.
 
 ## License
 

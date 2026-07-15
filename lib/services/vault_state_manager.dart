@@ -130,14 +130,16 @@ class VaultStateManager extends ChangeNotifier {
           'Too many failed attempts. Try again in $lockoutRemainingSeconds seconds.');
     }
 
+    var vaultOpened = false;
+    var unlockCompleted = false;
     try {
       await VaultChannel.openVault(passphrase);
+      vaultOpened = true;
 
       // Require biometric after passphrase
       final biometricSuccess =
           await VaultChannel.authenticateBiometric(throwOnError: true);
       if (!biometricSuccess) {
-        await VaultChannel.closeVault();
         throw Exception('Biometric authentication required');
       }
       await VaultChannel.recordAuthSuccess();
@@ -152,6 +154,7 @@ class VaultStateManager extends ChangeNotifier {
       _startIdleTimer();
       _startSessionTimer();
       notifyListeners();
+      unlockCompleted = true;
       return true;
     } on PlatformException catch (e) {
       if (e.code == 'RATE_LIMITED') {
@@ -163,6 +166,14 @@ class VaultStateManager extends ChangeNotifier {
     } catch (e) {
       _handleFailedAttempt();
       rethrow;
+    } finally {
+      if (vaultOpened && !unlockCompleted) {
+        try {
+          await VaultChannel.closeVault();
+        } catch (e) {
+          SecureLogger.e('VaultStateManager', 'Failed to close vault', e);
+        }
+      }
     }
   }
 
@@ -180,7 +191,8 @@ class VaultStateManager extends ChangeNotifier {
     // Try to load vault title from entries
     _currentVaultTitle = null;
     final titleEntry =
-        _entries.where((e) => e.name == '__vault_title__').firstOrNull;
+        _entries.where((e) => e.name == '__vault_title__').firstOrNull ??
+            _entries.where((e) => e.name == '__vault_title__.tmp').firstOrNull;
     SecureLogger.d(
         'VaultStateManager', 'Title entry found: ${titleEntry != null}');
     if (titleEntry != null) {
@@ -250,10 +262,11 @@ class VaultStateManager extends ChangeNotifier {
     SecureLogger.d(
         'VaultStateManager', 'Unfreezing timers after import operation');
 
-    // Reset activity and restart timers
-    _updateActivity();
-    _startIdleTimer();
-    _startSessionTimer();
+    if (_state == VaultState.unlocked) {
+      _updateActivity();
+      _startIdleTimer();
+      _startSessionTimer();
+    }
   }
 
   /// Run an action with timers frozen (for import operations)
@@ -973,6 +986,20 @@ class VaultStateManager extends ChangeNotifier {
     // Don't auto-lock if timers are frozen (during import operations)
     if (isBackground && _state == VaultState.unlocked && !_timersFrozen) {
       lockVault();
+    } else if (!isBackground && _state == VaultState.unlocked) {
+      _reconcileNativeVaultState();
+    }
+  }
+
+  Future<void> _reconcileNativeVaultState() async {
+    var isOpen = false;
+    try {
+      isOpen = await VaultChannel.isVaultOpen();
+    } catch (e) {
+      SecureLogger.e('VaultStateManager', 'Failed to verify vault state', e);
+    }
+    if (!isOpen && _state == VaultState.unlocked) {
+      await lockVault();
     }
   }
 

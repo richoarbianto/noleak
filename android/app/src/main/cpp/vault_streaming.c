@@ -352,6 +352,22 @@ static int load_state(const uint8_t import_id[VAULT_ID_LEN],
 
   close(fd);
 
+  uint32_t expected_chunks =
+      (uint32_t)((state->file_size + STREAMING_CHUNK_SIZE - 1) /
+                 STREAMING_CHUNK_SIZE);
+  uint64_t expected_written =
+      state->completed_chunks == state->total_chunks
+          ? state->file_size
+          : (uint64_t)state->completed_chunks * state->chunk_size;
+  if (state->file_size == 0 || state->file_size > STREAMING_MAX_FILE_SIZE ||
+      state->chunk_size != STREAMING_CHUNK_SIZE ||
+      state->total_chunks != expected_chunks ||
+      state->completed_chunks > state->total_chunks ||
+      state->bytes_written != expected_written) {
+    streaming_free_state(state);
+    return STREAMING_ERR_CHUNK_CORRUPTED;
+  }
+
   // Set pending dir
   state->pending_dir = get_import_dir(import_id);
   if (!state->file_name) {
@@ -465,6 +481,8 @@ int streaming_start(const char *source_uri,
       !resume_from_chunk_out) {
     return STREAMING_ERR_INVALID_PARAM;
   }
+  if (file_size == 0)
+    return STREAMING_ERR_INVALID_PARAM;
   if (file_size > STREAMING_MAX_FILE_SIZE) {
     return STREAMING_ERR_FILE_TOO_LARGE;
   }
@@ -482,6 +500,9 @@ int streaming_start(const char *source_uri,
   if (streaming_list_pending(&states, &count) == STREAMING_OK && count > 0) {
     for (uint32_t i = 0; i < count; i++) {
       if (memcmp(states[i].source_hash, source_hash, VAULT_HASH_LEN) == 0) {
+        if (states[i].file_size != file_size) {
+          continue;
+        }
         // Found matching import - resume
         memcpy(import_id_out, states[i].import_id, VAULT_ID_LEN);
         *resume_from_chunk_out = states[i].completed_chunks;
@@ -489,20 +510,43 @@ int streaming_start(const char *source_uri,
 
         // Load into active slot
         int slot = get_free_slot();
-        if (slot >= 0) {
-          g_active_imports[slot] = malloc(sizeof(streaming_import_state_t));
-          if (g_active_imports[slot]) {
-            memcpy(g_active_imports[slot], &states[i],
-                   sizeof(streaming_import_state_t));
-            g_active_imports[slot]->is_active = 1;
-            // Don't free strings - they're now owned by active import
-            states[i].source_uri = NULL;
-            states[i].file_name = NULL;
-            states[i].mime_type = NULL;
-            states[i].wrapped_dek = NULL;
-            states[i].pending_dir = NULL;
-          }
+        char *source_copy = strdup(source_uri);
+        char *name_copy = strdup(name);
+        char *mime_copy = strdup(mime ? mime : "");
+        if (slot < 0 || !source_copy || !name_copy || !mime_copy) {
+          free(source_copy);
+          free(name_copy);
+          free(mime_copy);
+          for (uint32_t j = 0; j < count; j++)
+            streaming_free_state(&states[j]);
+          free(states);
+          return STREAMING_ERR_MEMORY;
         }
+
+        free(states[i].source_uri);
+        free(states[i].file_name);
+        free(states[i].mime_type);
+        states[i].source_uri = source_copy;
+        states[i].file_name = name_copy;
+        states[i].mime_type = mime_copy;
+        states[i].file_type = type;
+
+        g_active_imports[slot] = malloc(sizeof(streaming_import_state_t));
+        if (!g_active_imports[slot]) {
+          for (uint32_t j = 0; j < count; j++)
+            streaming_free_state(&states[j]);
+          free(states);
+          return STREAMING_ERR_MEMORY;
+        }
+        memcpy(g_active_imports[slot], &states[i],
+               sizeof(streaming_import_state_t));
+        g_active_imports[slot]->is_active = 1;
+        // Don't free strings - they're now owned by active import
+        states[i].source_uri = NULL;
+        states[i].file_name = NULL;
+        states[i].mime_type = NULL;
+        states[i].wrapped_dek = NULL;
+        states[i].pending_dir = NULL;
 
         // Free remaining states
         for (uint32_t j = 0; j < count; j++) {
@@ -615,8 +659,10 @@ int streaming_start(const char *source_uri,
     state->is_active = 1;
     g_active_imports[slot] = state;
   } else {
+    streaming_abort(state->import_id);
     streaming_free_state(state);
     free(state);
+    return STREAMING_ERR_MEMORY;
   }
 
   LOGI("Streaming import started: total_chunks=%u", state->total_chunks);
@@ -655,10 +701,24 @@ int streaming_write_chunk(const uint8_t import_id[VAULT_ID_LEN],
     if (slot >= 0) {
       state->is_active = 1;
       g_active_imports[slot] = state;
+    } else {
+      streaming_free_state(state);
+      free(state);
+      vault_zeroize(plaintext, len);
+      return STREAMING_ERR_MEMORY;
     }
   }
 
-  if (chunk_index >= state->total_chunks) {
+  if (chunk_index != state->completed_chunks ||
+      chunk_index >= state->total_chunks) {
+    vault_zeroize(plaintext, len);
+    return STREAMING_ERR_INVALID_PARAM;
+  }
+  uint64_t chunk_offset = (uint64_t)chunk_index * state->chunk_size;
+  size_t expected_len = 0;
+  if (!streaming_chunk_plaintext_len(state->file_size, state->chunk_size,
+                                     chunk_index, &expected_len) ||
+      len != expected_len) {
     vault_zeroize(plaintext, len);
     return STREAMING_ERR_INVALID_PARAM;
   }
@@ -731,7 +791,7 @@ int streaming_write_chunk(const uint8_t import_id[VAULT_ID_LEN],
 
   // Update state
   state->completed_chunks = chunk_index + 1;
-  state->bytes_written += len;
+  state->bytes_written = chunk_offset + len;
   state->updated_at = get_timestamp_ms();
 
   // Save state periodically (every 10 chunks or on last chunk)
@@ -800,7 +860,8 @@ int streaming_finish(const uint8_t import_id[VAULT_ID_LEN],
   LOGD("streaming_finish: completed_chunks=%u, total_chunks=%u",
        state->completed_chunks, state->total_chunks);
 
-  if (state->completed_chunks != state->total_chunks) {
+  if (state->completed_chunks != state->total_chunks ||
+      state->bytes_written != state->file_size) {
     LOGE("Cannot finish: only %u/%u chunks complete", state->completed_chunks,
          state->total_chunks);
     if (state_allocated) {
@@ -855,37 +916,8 @@ int streaming_finish(const uint8_t import_id[VAULT_ID_LEN],
     return STREAMING_ERR_MEMORY;
   }
 
-  LOGD("streaming_finish: building payload from %u chunk files",
-       state->total_chunks);
-
-  // Build payload from chunk files
-  vault_payload_t new_payload;
-  memset(&new_payload, 0, sizeof(new_payload));
-  new_payload.chunk_count = state->total_chunks;
-  new_payload.chunks = calloc(state->total_chunks, sizeof(uint8_t *));
-  new_payload.chunk_lens = calloc(state->total_chunks, sizeof(size_t));
-
-  if (!new_payload.chunks || !new_payload.chunk_lens) {
-    LOGE("streaming_finish: failed to alloc payload arrays");
-    vault_free_entry(&new_entry);
-    if (new_payload.chunks)
-      free(new_payload.chunks);
-    if (new_payload.chunk_lens)
-      free(new_payload.chunk_lens);
-    if (state_allocated) {
-      streaming_free_state(state);
-      free(state);
-    }
-    // Cleanup pending files on error
-    streaming_abort(import_id);
-    return STREAMING_ERR_MEMORY;
-  }
-
-  // Read all chunk files
+  // Validate chunk files and retain only their small metadata in memory.
   int result = STREAMING_OK;
-#ifndef NDEBUG
-  size_t total_payload_size = 0;
-#endif
   for (uint32_t i = 0; i < state->total_chunks; i++) {
     char *chunk_path = get_chunk_path(import_id, i);
     if (!chunk_path) {
@@ -903,112 +935,48 @@ int streaming_finish(const uint8_t import_id[VAULT_ID_LEN],
       break;
     }
 
-    int fd = open(chunk_path, O_RDONLY);
-    free(chunk_path);
-    if (fd < 0) {
-      LOGE("streaming_finish: failed to open chunk %u (errno=%d)", i, errno);
-      result = STREAMING_ERR_IO;
+    size_t plain_len = 0;
+    if (!streaming_chunk_plaintext_len(state->file_size, state->chunk_size, i,
+                                       &plain_len)) {
+      free(chunk_path);
+      result = STREAMING_ERR_CHUNK_CORRUPTED;
       break;
     }
-
-    size_t chunk_len = st.st_size;
-    uint8_t *chunk_data = malloc(chunk_len);
-    if (!chunk_data) {
-      LOGE("streaming_finish: failed to alloc %zu bytes for chunk %u",
-           chunk_len, i);
-      close(fd);
-      result = STREAMING_ERR_MEMORY;
-      break;
-    }
-
-    if (read(fd, chunk_data, chunk_len) != (ssize_t)chunk_len) {
-      LOGE("streaming_finish: failed to read chunk %u (errno=%d)", i, errno);
-      free(chunk_data);
-      close(fd);
-      result = STREAMING_ERR_IO;
-      break;
-    }
-    close(fd);
-
-    // Extract nonce from chunk file
-    if (chunk_len < VAULT_NONCE_LEN + VAULT_TAG_LEN) {
-      LOGE("streaming_finish: chunk %u too small: %zu bytes", i, chunk_len);
-      free(chunk_data);
+    uint64_t expected_file_len = VAULT_NONCE_LEN + plain_len + VAULT_TAG_LEN;
+    if ((uint64_t)st.st_size != expected_file_len) {
+      LOGE("streaming_finish: invalid size for chunk %u", i);
+      free(chunk_path);
       result = STREAMING_ERR_CHUNK_CORRUPTED;
       break;
     }
 
-    memcpy(new_entry.chunks[i].nonce, chunk_data, VAULT_NONCE_LEN);
-
-    // Store ciphertext (without nonce prefix) for vault container
-    size_t ct_only_len = chunk_len - VAULT_NONCE_LEN;
-    uint8_t *ct_only = malloc(ct_only_len);
-    if (!ct_only) {
-      LOGE("streaming_finish: failed to alloc ct_only %zu bytes for chunk %u",
-           ct_only_len, i);
-      free(chunk_data);
-      result = STREAMING_ERR_MEMORY;
+    int fd = open(chunk_path, O_RDONLY);
+    free(chunk_path);
+    if (fd < 0 ||
+        read(fd, new_entry.chunks[i].nonce, VAULT_NONCE_LEN) !=
+            VAULT_NONCE_LEN) {
+      if (fd >= 0)
+        close(fd);
+      result = STREAMING_ERR_IO;
       break;
     }
-    memcpy(ct_only, chunk_data + VAULT_NONCE_LEN, ct_only_len);
-    vault_zeroize(chunk_data, chunk_len);
-    free(chunk_data);
-
-    new_payload.chunks[i] = ct_only;
-    new_payload.chunk_lens[i] = ct_only_len;
-    new_entry.chunks[i].length = (uint32_t)ct_only_len;
-#ifndef NDEBUG
-    total_payload_size += ct_only_len;
-
-    // Log progress every 10 chunks
-    if ((i + 1) % 10 == 0 || i == state->total_chunks - 1) {
-      LOGD("streaming_finish: loaded %u/%u chunks, total_size=%zu", i + 1,
-           state->total_chunks, total_payload_size);
-    }
-#endif
+    close(fd);
+    new_entry.chunks[i].length = (uint32_t)(plain_len + VAULT_TAG_LEN);
   }
 
   if (result != STREAMING_OK) {
-    LOGE("streaming_finish: chunk loading failed with %d", result);
-    // Cleanup on error
     vault_free_entry(&new_entry);
-    for (uint32_t i = 0; i < new_payload.chunk_count; i++) {
-      if (new_payload.chunks[i]) {
-        vault_zeroize(new_payload.chunks[i], new_payload.chunk_lens[i]);
-        free(new_payload.chunks[i]);
-      }
-    }
-    free(new_payload.chunks);
-    free(new_payload.chunk_lens);
     if (state_allocated) {
       streaming_free_state(state);
       free(state);
     }
-    // Cleanup pending files on error
     streaming_abort(import_id);
     return result;
   }
 
-  LOGD("streaming_finish: all chunks loaded, total_payload_size=%zu",
-       total_payload_size);
-
-  // PERFORMANCE OPTIMIZATION: Use vault_append_entry instead of full container
-  // rebuild This appends new data at end of file without loading existing
-  // payloads O(1) instead of O(n)
-
-  LOGI("streaming_finish: using vault_append_entry for efficient import");
-  result = vault_append_entry(&new_entry, &new_payload);
-
-  // Free the temporary entry and payload (vault_append_entry made deep copies)
+  LOGI("streaming_finish: committing chunks with bounded memory");
+  result = vault_append_entry_from_chunk_dir(&new_entry, state->pending_dir);
   vault_free_entry(&new_entry);
-  for (uint32_t i = 0; i < new_payload.chunk_count; i++) {
-    if (new_payload.chunks[i]) {
-      vault_zeroize(new_payload.chunks[i], new_payload.chunk_lens[i]);
-      free(new_payload.chunks[i]);
-    }
-  }
-  free(new_payload.chunks);
-  free(new_payload.chunk_lens);
 
   if (result != VAULT_OK) {
     LOGE("streaming_finish: vault_append_entry failed with %d", result);
@@ -1016,7 +984,6 @@ int streaming_finish(const uint8_t import_id[VAULT_ID_LEN],
       streaming_free_state(state);
       free(state);
     }
-    streaming_abort(import_id);
     return STREAMING_ERR_IO;
   }
 
