@@ -30,7 +30,7 @@
 
 ## Status
 
-NoLeak is an Android-only project under active development. The current application version is `1.0.1` (`versionCode 1001`) and requires Android 7.0/API 24 or newer.
+NoLeak is an Android-only project under active development. The current application version is `1.0.2` (`versionCode 1002`) and requires Android 7.0/API 24 or newer.
 
 Packaged releases are available from [GitHub Releases](https://github.com/richoarbianto/noleak/releases/latest).
 
@@ -80,11 +80,12 @@ NoLeak has no cloud sync, remote account, server-side recovery, or passphrase re
 - Configurable idle auto-lock: 10, 15, 20, or 30 seconds.
 - Configurable biometric session re-authentication: 3, 5, or 10 minutes.
 - Secure on-screen keyboard is enabled by default and can be disabled in settings.
-- Progressive password backoff and lockout protect vault opening and deletion.
+- Persistent per-vault backoff protects app-mediated password checks, including open, verify, title changes, password changes, and deletion. After five failures, lockout starts at one minute and doubles up to 30 minutes.
 
 ## Supported imports
 
-Import validation currently accepts the following MIME types:
+NoLeak can store any non-empty file type up to 50 GiB. MIME metadata selects
+the best available viewer; it does not block import.
 
 | Category | Formats |
 | --- | --- |
@@ -93,8 +94,11 @@ Import validation currently accepts the following MIME types:
 | Audio | MP3, M4A/MP4 audio, AAC, WAV, OGG, OPUS, FLAC |
 | Documents | PDF, DOCX, XLSX, PPTX |
 | Text and keys | TXT, PEM, SSH public keys, PGP/ASC, PKCS#8 |
+| Other formats | Sanitized raw preview, limited to 4,096 characters |
 
-Playback and rendering still depend on Android device codec and platform support.
+Playback and rich rendering still depend on Android device codec and platform
+support. When no dedicated viewer is available, NoLeak decrypts only a bounded
+prefix for the raw preview and does not create a plaintext temporary file.
 
 ## Operational limits
 
@@ -105,6 +109,7 @@ Playback and rendering still depend on Android device codec and platform support
 | Streaming import threshold | More than 10 MiB |
 | Whole-file in-memory viewer limit | 64 MiB |
 | Office preview output | 200,000 characters |
+| Raw preview output | 4,096 characters (16 KiB input cap) |
 
 Video and PDF use streaming/page-based paths. Image, Office, and audio flows that require a complete in-memory buffer reject files above the 64 MiB viewer limit instead of risking an out-of-memory crash.
 
@@ -119,18 +124,26 @@ Implemented controls include:
 - no Android `INTERNET` permission;
 - Android backup and data extraction disabled;
 - XChaCha20-Poly1305 authenticated encryption through libsodium;
-- Argon2id passphrase derivation with device-adaptive memory parameters;
+- Argon2id passphrase derivation; new vaults select 64, 128, or 256 MiB from current Android memory signals and process architecture, while existing vaults always use the exact parameters stored in their header. The current libsodium `crypto_pwhash` API uses effective parallelism 1; legacy NoLeak headers containing 2 remain readable because older builds stored that value without applying it;
+- imported vault headers are validated before registration, and the app warns when their memory or work-factor profile exceeds the profile selected for the current device;
 - a random vault master key wrapped by the passphrase-derived key;
 - a separate random data-encryption key for each file, wrapped by the vault master key;
-- an authenticated encrypted index plus a SHA-256 container integrity hash;
+- authenticated file data and an authenticated encrypted index, plus a SHA-256 container consistency hash;
 - Android Keystore and AndroidX Biometric integration for biometric-gated flows;
-- password backoff and lockout for brute-force resistance;
+- passphrases transported through app-controlled Dart, Kotlin, and JNI APIs as mutable UTF-8 byte buffers that are zeroized after use;
+- native key and plaintext-buffer zeroization, with best-effort `sodium_mlock` protection for the in-memory master key;
+- persistent per-vault password backoff for attempts made through the app;
 - lifecycle, idle, and session locking with native key cleanup;
 - Android `FLAG_SECURE` to reduce screenshots and screen recording;
+- overlay hiding on supported Android versions and rejection of obscured touch events;
 - fail-closed checks for root/Magisk artifacts, Frida/hooking, debuggers, tracing, ADB, emulators, bootloader state, install source, build tags, and signing certificate;
 - release minification and debug-only logging wrappers intended to avoid sensitive production logs.
 
 Runtime tamper checks can produce device-specific compatibility failures and cannot make a compromised operating system trustworthy. They do not replace strong passphrases, current Android security updates, or safe device handling. Secure deletion on flash storage is best effort because wear leveling can retain physical copies outside application control.
+
+The app lockout is not an offline-attack boundary. Anyone who obtains a copy of a vault container can test passphrase candidates outside NoLeak without its SharedPreferences counter. Offline resistance therefore depends on the stored Argon2id cost and a strong, unique passphrase. A memory-allocation failure while opening an existing high-cost vault is reported separately and never retried with different KDF parameters.
+
+Memory clearing is best effort across managed runtimes and platform-channel serialization; it reduces secret lifetime but cannot prove that every transient framework copy was overwritten. Revealing a passphrase also requires a temporary displayable string until the field is hidden again.
 
 ## Cryptography and container format
 
@@ -148,7 +161,7 @@ Passphrase
 | Key derivation | Argon2id |
 | Randomness | libsodium CSPRNG |
 | Container index | Authenticated encryption with file/chunk offsets and metadata |
-| Container integrity | SHA-256 over container contents |
+| Container consistency | SHA-256 over container contents; AEAD tags authenticate encrypted data and metadata |
 | Registry metadata | Android Keystore-backed encryption |
 | Biometrics | AndroidX Biometric / Android Keystore |
 

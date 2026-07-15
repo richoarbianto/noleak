@@ -19,6 +19,7 @@
 
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../models/vault_info.dart';
 import '../services/vault_registry.dart';
 import '../services/vault_channel.dart';
@@ -30,6 +31,7 @@ import '../widgets/cyber_text_field.dart';
 import '../widgets/password_strength_meter.dart';
 import '../widgets/loading_overlay.dart';
 import '../widgets/secure_keyboard.dart';
+import '../widgets/responsive_layout.dart';
 import 'vault_info_screen.dart';
 import '../utils/secure_logger.dart';
 import '../utils/secure_passphrase.dart';
@@ -53,6 +55,9 @@ class VaultDashboardScreen extends StatefulWidget {
 }
 
 class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
+  String _authError(Object error, String fallback) =>
+      error is PlatformException ? (error.message ?? fallback) : fallback;
+
   final _transferProgressService = TransferProgressService.instance;
   final Map<String, String> _revealedDetails = {};
   final Map<String, DateTime> _revealTimers = {};
@@ -145,7 +150,7 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
   }
 
   Future<void> _createVault() async {
-    final result = await showDialog<Map<String, String>>(
+    final result = await showDialog<Map<String, Object>>(
       context: context,
       barrierDismissible: false,
       builder: (context) => const _CreateVaultDialog(),
@@ -153,12 +158,13 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
 
     if (result == null) return;
 
+    final password = result['password']! as Uint8List;
     setState(() => _isCreating = true);
 
     try {
       final success = await widget.registry.createVault(
-        title: result['title']!,
-        password: result['password']!,
+        title: result['title']! as String,
+        password: password,
       );
 
       if (mounted) {
@@ -182,6 +188,7 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
         }
       }
     } finally {
+      SecurePassphrase.zeroize(password);
       if (mounted) setState(() => _isCreating = false);
     }
   }
@@ -200,9 +207,11 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
       _importProgress = 0;
     });
 
+    Map<String, dynamic>? importedVault;
     try {
       // Import from URI with progress tracking
       final result = await VaultChannel.importVaultFromUri(uri);
+      importedVault = result;
       final success = result != null;
 
       if (success) {
@@ -223,9 +232,12 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
       }
     } catch (e) {
       if (mounted) {
+        final message = e is PlatformException
+            ? (e.message ?? 'Vault file could not be imported')
+            : 'Vault file could not be imported';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Import failed: $e'),
+            content: Text('Import failed: $message'),
             backgroundColor: CyberpunkTheme.error,
           ),
         );
@@ -238,6 +250,43 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
         });
       }
     }
+
+    if (mounted && importedVault?['kdfExceedsDevice'] == true) {
+      await _showKdfCompatibilityAlert(importedVault!);
+    }
+  }
+
+  Future<void> _showKdfCompatibilityAlert(
+      Map<String, dynamic> importedVault) async {
+    final memory = importedVault['kdfMemoryMiB'] as num;
+    final opslimit = importedVault['kdfOpslimit'] as num;
+    final deviceMemory = importedVault['deviceKdfMemoryMiB'] as num;
+    final deviceOpslimit = importedVault['deviceKdfOpslimit'] as num;
+    final higherMemory = memory > deviceMemory;
+
+    final impact = higherMemory
+        ? 'Unlocking may be slower or fail if Android cannot allocate '
+            '$memory MiB of memory.'
+        : 'Unlocking may take longer than vaults created on this device.';
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Higher KDF profile detected'),
+        content: Text(
+          'Imported vault: $memory MiB, opslimit $opslimit.\n'
+          'This device profile: $deviceMemory MiB, opslimit $deviceOpslimit.\n\n'
+          '$impact NoLeak preserves the imported parameters because changing '
+          'them would derive a different encryption key.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Understood'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _revealDetail(VaultInfo vault) async {
@@ -249,9 +298,7 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
     try {
       SecureLogger.d(
           'VaultDashboard', 'Revealing details for vault ${vault.id}');
-      await VaultChannel.openVaultById(vaultId: vault.id, password: password);
       final title = await widget.registry.revealTitle(vault.id, password);
-      await VaultChannel.closeVault();
 
       if (mounted) {
         setState(() {
@@ -277,13 +324,14 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
       SecureLogger.e('VaultDashboard', 'Reveal failed', e);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Incorrect password'),
+          SnackBar(
+            content: Text(_authError(e, 'Incorrect password')),
             backgroundColor: CyberpunkTheme.error,
           ),
         );
       }
     } finally {
+      SecurePassphrase.zeroize(password);
       if (mounted) {
         setState(() => _revealingVaults.remove(vault.id));
       }
@@ -299,57 +347,51 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
         await _askPassword('Edit Title', 'Enter password to edit vault title:');
     if (password == null) return;
 
-    String currentTitle;
     try {
-      await VaultChannel.openVaultById(vaultId: vault.id, password: password);
       final result = await widget.registry.revealTitle(vault.id, password);
-      currentTitle = result ?? '';
-      await VaultChannel.closeVault();
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Incorrect password'),
-            backgroundColor: CyberpunkTheme.error,
-          ),
-        );
-      }
-      return;
-    }
+      final currentTitle = result ?? '';
+      if (!mounted) return;
 
-    if (!mounted) return;
+      final newTitle = await showDialog<String>(
+        context: context,
+        builder: (context) => _EditTitleDialog(currentTitle: currentTitle),
+      );
+      if (newTitle == null || newTitle == currentTitle) return;
 
-    final newTitle = await showDialog<String>(
-      context: context,
-      builder: (context) => _EditTitleDialog(currentTitle: currentTitle),
-    );
-
-    if (newTitle == null || newTitle == currentTitle) return;
-
-    final success =
-        await widget.registry.updateTitle(vault.id, password, newTitle);
-
-    if (mounted) {
-      if (success) {
-        setState(() {
-          if (_revealedDetails.containsKey(vault.id)) {
-            _revealedDetails[vault.id] = newTitle;
-          }
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('Title updated'),
-            backgroundColor: CyberpunkTheme.neonGreen.withOpacity(0.9),
-          ),
-        );
-      } else {
+      final success =
+          await widget.registry.updateTitle(vault.id, password, newTitle);
+      if (!mounted) return;
+      if (!success) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('Failed to update title'),
             backgroundColor: CyberpunkTheme.error,
           ),
         );
+        return;
       }
+      setState(() {
+        if (_revealedDetails.containsKey(vault.id)) {
+          _revealedDetails[vault.id] = newTitle;
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Title updated'),
+          backgroundColor: CyberpunkTheme.neonGreen.withOpacity(0.9),
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(_authError(e, 'Incorrect password')),
+            backgroundColor: CyberpunkTheme.error,
+          ),
+        );
+      }
+    } finally {
+      SecurePassphrase.zeroize(password);
     }
   }
 
@@ -394,12 +436,24 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
         'Delete Vault', 'Enter password to delete this vault:');
     if (password == null) return;
 
-    final success = await widget.registry.deleteVault(vault.id, password);
+    bool success = false;
+    Object? error;
+    try {
+      success = await widget.registry.deleteVault(vault.id, password);
+    } catch (e) {
+      error = e;
+    } finally {
+      SecurePassphrase.zeroize(password);
+    }
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(success ? 'Vault deleted' : 'Failed to delete vault'),
+          content: Text(success
+              ? 'Vault deleted'
+              : error is PlatformException
+                  ? (error.message ?? 'Failed to delete vault')
+                  : 'Failed to delete vault'),
           backgroundColor:
               success ? CyberpunkTheme.warning : CyberpunkTheme.error,
         ),
@@ -418,13 +472,15 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Incorrect password'),
+          SnackBar(
+            content: Text(_authError(e, 'Incorrect password')),
             backgroundColor: CyberpunkTheme.error,
           ),
         );
       }
       return;
+    } finally {
+      SecurePassphrase.zeroize(password);
     }
 
     setState(() {
@@ -472,11 +528,11 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
     }
   }
 
-  Future<String?> _askPassword(String title, String message) async {
+  Future<Uint8List?> _askPassword(String title, String message) async {
     final controller = TextEditingController();
     bool obscure = true;
 
-    final password = await showDialog<String>(
+    final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setState) => AlertDialog(
@@ -503,6 +559,7 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
               CyberTextField(
                 controller: controller,
                 obscureText: obscure,
+                secureInput: true,
                 labelText: 'Password',
                 suffixIcon: IconButton(
                   icon: Icon(
@@ -521,7 +578,7 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
                   style: TextStyle(color: CyberpunkTheme.textSecondary)),
             ),
             TextButton(
-              onPressed: () => Navigator.pop(context, controller.text),
+              onPressed: () => Navigator.pop(context, true),
               child: const Text('OK',
                   style: TextStyle(color: CyberpunkTheme.neonGreen)),
             ),
@@ -529,6 +586,13 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
         ),
       ),
     );
+
+    final password = confirmed == true &&
+            !SecurePassphrase.controllerIsEmpty(controller) &&
+            SecurePassphrase.controllerWithinLimit(controller)
+        ? SecurePassphrase.fromController(controller)
+        : null;
+    SecurePassphrase.clearController(controller);
 
     // CRITICAL: Clear SecureKeyboard target FIRST to prevent it from accessing
     // the controller during widget rebuilds. This must happen synchronously.
@@ -546,7 +610,7 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
       SecurePassphrase.disposeController(controller);
     });
 
-    return password?.isNotEmpty == true ? password : null;
+    return password;
   }
 
   @override
@@ -570,6 +634,8 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
         appBar: AppBar(
           title: const Text(
             'NOLEAK VAULTS',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: TextStyle(
               letterSpacing: 3,
               fontWeight: FontWeight.w600,
@@ -577,6 +643,7 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
           ),
           backgroundColor: Colors.transparent,
           elevation: 0,
+          centerTitle: false,
           actions: [
             // Hide All button - only show when there are revealed details
             if (_hasRevealedDetails)
@@ -690,110 +757,108 @@ class _VaultDashboardScreenState extends State<VaultDashboardScreen> {
   }
 
   Widget _buildEmptyState() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            // Glowing shield icon
-            Container(
-              padding: const EdgeInsets.all(32),
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: CyberpunkTheme.neonGreen.withOpacity(0.2),
-                    blurRadius: 50,
-                    spreadRadius: 10,
-                  ),
-                ],
-              ),
-              child: const Icon(
-                Icons.shield_outlined,
-                size: 80,
-                color: CyberpunkTheme.neonGreen,
-              ),
-            ),
-            const SizedBox(height: 24),
-            // Cyberpunk slogan with glitch effect styling
-            ShaderMask(
-              shaderCallback: (bounds) => LinearGradient(
-                colors: [
-                  CyberpunkTheme.neonGreen,
-                  CyberpunkTheme.neonGreen.withOpacity(0.7),
-                  CyberpunkTheme.textPrimary,
-                ],
-                stops: const [0.0, 0.5, 1.0],
-              ).createShader(bounds),
-              child: const Text(
-                'TAKE BACK CONTROL',
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w900,
-                  color: Colors.white,
-                  letterSpacing: 4,
+    return ResponsiveScrollView(
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 96),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Glowing shield icon
+          Container(
+            padding: const EdgeInsets.all(32),
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: CyberpunkTheme.neonGreen.withOpacity(0.2),
+                  blurRadius: 50,
+                  spreadRadius: 10,
                 ),
-                textAlign: TextAlign.center,
-              ),
+              ],
             ),
-            const SizedBox(height: 4),
-            Text(
-              'OF YOUR PRIVACY',
+            child: const Icon(
+              Icons.shield_outlined,
+              size: 80,
+              color: CyberpunkTheme.neonGreen,
+            ),
+          ),
+          const SizedBox(height: 24),
+          // Cyberpunk slogan with glitch effect styling
+          ShaderMask(
+            shaderCallback: (bounds) => LinearGradient(
+              colors: [
+                CyberpunkTheme.neonGreen,
+                CyberpunkTheme.neonGreen.withOpacity(0.7),
+                CyberpunkTheme.textPrimary,
+              ],
+              stops: const [0.0, 0.5, 1.0],
+            ).createShader(bounds),
+            child: const Text(
+              'TAKE BACK CONTROL',
               style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.w300,
-                color: CyberpunkTheme.neonGreen.withOpacity(0.8),
-                letterSpacing: 6,
+                fontSize: 22,
+                fontWeight: FontWeight.w900,
+                color: Colors.white,
+                letterSpacing: 4,
               ),
               textAlign: TextAlign.center,
             ),
-            const SizedBox(height: 32),
-            const Text(
-              'NO VAULTS YET',
-              style: TextStyle(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
-                color: CyberpunkTheme.textPrimary,
-                letterSpacing: 3,
-              ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'OF YOUR PRIVACY',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w300,
+              color: CyberpunkTheme.neonGreen.withOpacity(0.8),
+              letterSpacing: 6,
             ),
-            const SizedBox(height: 8),
-            const Text(
-              'Create a new vault or import an existing one',
-              style: TextStyle(
-                fontSize: 14,
-                color: CyberpunkTheme.textSecondary,
-              ),
-              textAlign: TextAlign.center,
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 32),
+          const Text(
+            'NO VAULTS YET',
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+              color: CyberpunkTheme.textPrimary,
+              letterSpacing: 3,
             ),
-            const SizedBox(height: 40),
-            SizedBox(
-              width: 280,
-              child: CyberButton(
-                text: 'CREATE VAULT',
-                icon: Icons.add,
-                onPressed: (_isCreating || _isImporting || _isExporting)
-                    ? null
-                    : _createVault,
-                isLoading: _isCreating,
-              ),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Create a new vault or import an existing one',
+            style: TextStyle(
+              fontSize: 14,
+              color: CyberpunkTheme.textSecondary,
             ),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: 280,
-              child: CyberButton(
-                text: 'IMPORT VAULT',
-                icon: Icons.file_download,
-                onPressed: (_isImporting || _isCreating || _isExporting)
-                    ? null
-                    : _importVault,
-                isLoading: _isImporting,
-                outlined: true,
-              ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 40),
+          SizedBox(
+            width: 280,
+            child: CyberButton(
+              text: 'CREATE VAULT',
+              icon: Icons.add,
+              onPressed: (_isCreating || _isImporting || _isExporting)
+                  ? null
+                  : _createVault,
+              isLoading: _isCreating,
             ),
-          ],
-        ),
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: 280,
+            child: CyberButton(
+              text: 'IMPORT VAULT',
+              icon: Icons.file_download,
+              onPressed: (_isImporting || _isCreating || _isExporting)
+                  ? null
+                  : _importVault,
+              isLoading: _isImporting,
+              outlined: true,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1122,21 +1187,18 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
 
   bool get _isValid {
     return _titleController.text.isNotEmpty &&
-        _meetsPassphraseRules(_passwordController.text) &&
-        _passwordController.text == _confirmController.text;
+        _meetsPassphraseRules() &&
+        SecurePassphrase.controllersMatch(
+          _passwordController,
+          _confirmController,
+        );
   }
 
-  bool _meetsPassphraseRules(String pass) {
-    return pass.length >= 12 && _hasNumber(pass) && _hasSymbol(pass);
-  }
-
-  bool _hasNumber(String pass) {
-    return RegExp(r'[0-9]').hasMatch(pass);
-  }
-
-  bool _hasSymbol(String pass) {
-    return RegExp(r'[^A-Za-z0-9]').hasMatch(pass);
-  }
+  bool _meetsPassphraseRules() =>
+      SecurePassphrase.controllerWithinLimit(_passwordController) &&
+      SecurePassphrase.controllerLength(_passwordController) >= 12 &&
+      SecurePassphrase.controllerHasNumber(_passwordController) &&
+      SecurePassphrase.controllerHasSymbol(_passwordController);
 
   @override
   void dispose() {
@@ -1214,6 +1276,7 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
                 labelText: 'Password',
                 hintText: 'Min 12 chars + 1 number + 1 symbol',
                 obscureText: _obscurePassword,
+                secureInput: true,
                 onChanged: (_) => setState(() {}),
                 suffixIcon: IconButton(
                   icon: Icon(
@@ -1226,12 +1289,13 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
               ),
 
               // Password strength meter
-              PasswordStrengthMeter(
-                password: _passwordController.text,
-                minLength: 12,
-              ),
-              if (_passwordController.text.isNotEmpty &&
-                  !_meetsPassphraseRules(_passwordController.text))
+              if (!AppSettings.instance.secureKeyboardEnabled)
+                PasswordStrengthMeter(
+                  password: _passwordController.text,
+                  minLength: 12,
+                ),
+              if (!SecurePassphrase.controllerIsEmpty(_passwordController) &&
+                  !_meetsPassphraseRules())
                 Padding(
                   padding: const EdgeInsets.only(top: 8),
                   child: Text(
@@ -1249,11 +1313,16 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
                 controller: _confirmController,
                 labelText: 'Confirm Password',
                 obscureText: _obscureConfirm,
+                secureInput: true,
                 onChanged: (_) => setState(() {}),
-                errorText: _confirmController.text.isNotEmpty &&
-                        _passwordController.text != _confirmController.text
-                    ? 'Passwords do not match'
-                    : null,
+                errorText:
+                    !SecurePassphrase.controllerIsEmpty(_confirmController) &&
+                            !SecurePassphrase.controllersMatch(
+                              _passwordController,
+                              _confirmController,
+                            )
+                        ? 'Passwords do not match'
+                        : null,
                 suffixIcon: IconButton(
                   icon: Icon(
                     _obscureConfirm ? Icons.visibility : Icons.visibility_off,
@@ -1312,10 +1381,21 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
                       text: 'CREATE',
                       icon: Icons.add,
                       onPressed: _isValid
-                          ? () => Navigator.pop(context, {
+                          ? () {
+                              final password = SecurePassphrase.fromController(
+                                _passwordController,
+                              );
+                              SecurePassphrase.clearController(
+                                _passwordController,
+                              );
+                              SecurePassphrase.clearController(
+                                _confirmController,
+                              );
+                              Navigator.pop<Map<String, Object>>(context, {
                                 'title': _titleController.text,
-                                'password': _passwordController.text,
-                              })
+                                'password': password,
+                              });
+                            }
                           : null,
                     ),
                   ),
@@ -1831,7 +1911,7 @@ class _SettingsSheetState extends State<_SettingsSheet> {
                       'Vault unlock always requires biometric after password',
                       style: TextStyle(
                         color: CyberpunkTheme.textHint,
-                        fontSize: 11,
+                        fontSize: 12,
                       ),
                     ),
                   ),

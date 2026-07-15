@@ -1,15 +1,15 @@
 /// CyberTextField - Cyberpunk-Styled Text Input Field
-/// 
+///
 /// A themed text field with neon glow effects on focus. Automatically
 /// integrates with [SecureKeyboard] when enabled in settings to provide
 /// anti-keylogger protection for sensitive input.
-/// 
+///
 /// Features:
 /// - Animated glow border on focus
 /// - Automatic SecureKeyboard integration
 /// - Password visibility toggle support
 /// - Error state display
-/// 
+///
 /// SECURITY: When SecureKeyboard is enabled, the field becomes read-only
 /// and all input is handled through the on-screen secure keyboard to
 /// prevent keylogger attacks.
@@ -20,7 +20,7 @@ import '../services/app_settings.dart';
 import 'secure_keyboard.dart';
 
 /// Cyberpunk styled text field with neon glow on focus.
-/// 
+///
 /// Example usage:
 /// ```dart
 /// CyberTextField(
@@ -38,6 +38,7 @@ class CyberTextField extends StatefulWidget {
   final String? labelText;
   final String? hintText;
   final bool obscureText;
+  final bool secureInput;
   final Widget? suffixIcon;
   final String? errorText;
   final bool enabled;
@@ -54,6 +55,7 @@ class CyberTextField extends StatefulWidget {
     this.labelText,
     this.hintText,
     this.obscureText = false,
+    this.secureInput = false,
     this.suffixIcon,
     this.errorText,
     this.enabled = true,
@@ -102,6 +104,9 @@ class _CyberTextFieldState extends State<CyberTextField> {
         _ownsController = true;
       }
     }
+    if (widget.secureInput && widget.obscureText != oldWidget.obscureText) {
+      SecureKeyboard.setObscured(_controller, widget.obscureText);
+    }
   }
 
   @override
@@ -128,6 +133,8 @@ class _CyberTextFieldState extends State<CyberTextField> {
       SecureKeyboard.show(
         context,
         controller: _controller,
+        secureInput: widget.secureInput,
+        obscureText: widget.obscureText,
         onChanged: widget.onChanged,
         onSubmitted: widget.onSubmitted,
       );
@@ -169,7 +176,8 @@ class _CyberTextFieldState extends State<CyberTextField> {
           focusNode: widget.focusNode,
           obscureText: widget.obscureText,
           enabled: widget.enabled,
-          readOnly: _useSecureKeyboard, // Only readOnly when using secure keyboard
+          readOnly:
+              _useSecureKeyboard, // Only readOnly when using secure keyboard
           onTap: _useSecureKeyboard ? _showSecureKeyboard : null,
           onChanged: _useSecureKeyboard ? null : widget.onChanged,
           onSubmitted: _useSecureKeyboard ? null : widget.onSubmitted,

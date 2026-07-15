@@ -85,6 +85,8 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         private const val IMPORT_VAULT_REQUEST = 1003
         private const val PICK_FOLDER_REQUEST = 1004
         private const val EXPORT_FILE_REQUEST = 1005
+        private const val MIN_PASSPHRASE_BYTES = 12
+        private const val MAX_PASSPHRASE_BYTES = 1024
         
         @Volatile
         private var instance: VaultPlugin? = null
@@ -133,6 +135,80 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         val validation: SafFileHandler.FileValidationResult.Valid,
         val folder: String
     )
+
+    private fun passwordBytes(
+        call: MethodCall,
+        key: String,
+        result: MethodChannel.Result,
+        minimumBytes: Int = 1
+    ): ByteArray? {
+        val password = call.argument<ByteArray>(key)
+        if (password == null || password.size < minimumBytes || password.size > MAX_PASSPHRASE_BYTES) {
+            VaultEngine.secureZeroize(password)
+            result.error(
+                "INVALID_ARGUMENT",
+                "$key must be $minimumBytes-$MAX_PASSPHRASE_BYTES UTF-8 bytes",
+                null
+            )
+            return null
+        }
+        return password
+    }
+
+    private fun secondsCeil(milliseconds: Long): Long =
+        (milliseconds.coerceAtLeast(0L) + 999L) / 1000L
+
+    private fun rejectRateLimited(vaultId: String?, result: MethodChannel.Result): Boolean {
+        val waitMs = if (passwordRateLimiter.isLockedOut(vaultId)) {
+            passwordRateLimiter.getRemainingLockoutMs(vaultId)
+        } else {
+            passwordRateLimiter.getBackoffMs(vaultId)
+        }
+        if (waitMs <= 0L) return false
+        val seconds = secondsCeil(waitMs)
+        result.error(
+            "RATE_LIMITED",
+            "Too many attempts. Try again in ${seconds}s",
+            mapOf("remainingSeconds" to seconds)
+        )
+        return true
+    }
+
+    private fun reportAuthFailure(vaultId: String?, result: MethodChannel.Result) {
+        val remaining = passwordRateLimiter.recordFailure(vaultId)
+        if (remaining == -1) {
+            val seconds = secondsCeil(passwordRateLimiter.getRemainingLockoutMs(vaultId))
+            result.error(
+                "RATE_LIMITED",
+                "Too many attempts. Try again in ${seconds}s",
+                mapOf("remainingSeconds" to seconds)
+            )
+        } else {
+            result.error(
+                "AUTH_FAILED",
+                "Incorrect password",
+                mapOf("remainingAttempts" to remaining)
+            )
+        }
+    }
+
+    private fun reportVaultFailure(
+        error: Throwable,
+        result: MethodChannel.Result,
+        defaultCode: String
+    ) {
+        when {
+            error is VaultException && error.errorCode == VaultEngine.VAULT_ERR_MEMORY ->
+                result.error(
+                    "KDF_MEMORY_REQUIRED",
+                    "Not enough memory for this vault's stored Argon2id profile",
+                    mapOf("requiredByStoredProfile" to true)
+                )
+            error is VaultException && error.isCorrupted() ->
+                result.error("CORRUPTED", "Vault file is corrupted", null)
+            else -> result.error(defaultCode, error.message ?: "Vault operation failed", null)
+        }
+    }
     
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         instance = this
@@ -206,6 +282,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             "checkEnvironment" -> handleCheckEnvironment(result)
             "vaultExists" -> handleVaultExists(result)
             "isVaultOpen" -> handleIsVaultOpen(result)
+            "getKdfInfo" -> result.success(vaultBridge.getKdfInfo())
             "createVault" -> handleCreateVault(call, result)
             "openVault" -> handleOpenVault(call, result)
             "closeVault" -> handleCloseVault(result)
@@ -286,86 +363,43 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
     }
     
     private fun handleCreateVault(call: MethodCall, result: MethodChannel.Result) {
-        val passphrase = call.argument<String>("passphrase")
-        if (passphrase == null) {
-            result.error("INVALID_ARGUMENT", "Passphrase required", null)
-            return
-        }
+        val passphrase = passwordBytes(call, "passphrase", result, MIN_PASSPHRASE_BYTES) ?: return
         
         scope.launch {
-            vaultBridge.createVault(passphrase).fold(
-                onSuccess = { result.success(true) },
-                onFailure = { e -> result.error("CREATE_FAILED", e.message, null) }
-            )
+            try {
+                vaultBridge.createVault(passphrase).fold(
+                    onSuccess = { result.success(true) },
+                    onFailure = { e -> reportVaultFailure(e, result, "CREATE_FAILED") }
+                )
+            } finally {
+                VaultEngine.secureZeroize(passphrase)
+            }
         }
     }
     
     private fun handleOpenVault(call: MethodCall, result: MethodChannel.Result) {
-        val passphrase = call.argument<String>("passphrase")
-        if (passphrase == null) {
-            result.error("INVALID_ARGUMENT", "Passphrase required", null)
-            return
-        }
+        val passphrase = passwordBytes(call, "passphrase", result) ?: return
 
-        // SECURITY: Rate limiting to prevent brute-force
-        if (passwordRateLimiter.isLockedOut()) {
-            val remainingSecs = passwordRateLimiter.getRemainingLockoutMs() / 1000
-            result.error(
-                "RATE_LIMITED",
-                "Too many attempts. Try again in ${remainingSecs}s",
-                mapOf("remainingSeconds" to remainingSecs)
-            )
-            return
-        }
-
-        val backoffMs = passwordRateLimiter.getBackoffMs()
-        if (backoffMs > 0) {
-            val remainingSecs = backoffMs / 1000
-            result.error(
-                "RATE_LIMITED",
-                "Wait ${remainingSecs}s before next attempt",
-                mapOf("remainingSeconds" to remainingSecs)
-            )
+        if (rejectRateLimited(null, result)) {
+            VaultEngine.secureZeroize(passphrase)
             return
         }
         
         scope.launch {
-            vaultBridge.openVault(passphrase).fold(
-                onSuccess = {
-                    result.success(true)
-                },
-                onFailure = { e -> 
-                    if (e is VaultException && e.isAuthError()) {
-                        val remaining = passwordRateLimiter.recordFailure()
-                        if (remaining == -1) {
-                            val remainingSecs = passwordRateLimiter.getRemainingLockoutMs() / 1000
-                            result.error(
-                                "RATE_LIMITED",
-                                "Too many attempts. Try again in ${remainingSecs}s",
-                                mapOf("remainingSeconds" to remainingSecs)
-                            )
+            try {
+                vaultBridge.openVault(passphrase).fold(
+                    onSuccess = { result.success(true) },
+                    onFailure = { e ->
+                        if (e is VaultException && e.isAuthError()) {
+                            reportAuthFailure(null, result)
                         } else {
-                            result.error(
-                                "AUTH_FAILED",
-                                "Incorrect password",
-                                mapOf("remainingAttempts" to remaining)
-                            )
+                            reportVaultFailure(e, result, "OPEN_FAILED")
                         }
-                        return@fold
                     }
-                    val code = when {
-                        e.message?.contains("Authentication") == true -> "AUTH_FAILED"
-                        e.message?.contains("corrupted") == true -> "CORRUPTED"
-                        else -> "OPEN_FAILED"
-                    }
-                    val message = when (code) {
-                        "AUTH_FAILED" -> "Incorrect password"
-                        "CORRUPTED" -> "Vault file is corrupted"
-                        else -> e.message ?: "Failed to open vault"
-                    }
-                    result.error(code, message, null)
-                }
-            )
+                )
+            } finally {
+                VaultEngine.secureZeroize(passphrase)
+            }
         }
     }
     
@@ -500,7 +534,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 SecureLog.d("VaultPlugin", "handleImportFile: file valid, type=${validation.fileType}, name=${validation.name}, size=${validation.size}")
                 scope.launch {
                     // SECURITY: Use streaming for large files to avoid OOM
-                    val useStreaming = safFileHandler.shouldUseStreaming(uri, validation.fileType)
+                    val useStreaming = safFileHandler.shouldUseStreaming(uri, validation.mimeType)
                     SecureLog.d("VaultPlugin", "handleImportFile: useStreaming=$useStreaming (size=${validation.size})")
                     
                     if (useStreaming) {
@@ -511,10 +545,6 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                         handleImportFileSmall(uri, validation, sessionId, result)
                     }
                 }
-            }
-            is SafFileHandler.FileValidationResult.UnsupportedType -> {
-                SecureLog.e("VaultPlugin", "handleImportFile: unsupported type ${validation.mimeType}")
-                result.error("UNSUPPORTED_TYPE", "File type not supported: ${validation.mimeType}", null)
             }
             is SafFileHandler.FileValidationResult.TooLarge -> {
                 SecureLog.e("VaultPlugin", "handleImportFile: file too large ${validation.size}")
@@ -580,7 +610,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
 
         if (targets.isEmpty()) {
             SecureLog.e("VaultPlugin", "handleImportFolder: folder is empty")
-            result.error("EMPTY_FOLDER", "Folder is empty or contains no supported files", null)
+            result.error("EMPTY_FOLDER", "Folder is empty or contains no importable files", null)
             return
         }
 
@@ -602,7 +632,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
 
             for (target in targets) {
                 val validation = target.validation
-                val useStreaming = safFileHandler.shouldUseStreaming(target.uri, validation.fileType)
+                val useStreaming = safFileHandler.shouldUseStreaming(target.uri, validation.mimeType)
                 // FIXED: Use only the file name, folder mapping is handled separately by Dart
                 // Previously used fullName with folder path which caused file names like "Folder/file.txt"
                 val fileName = validation.name
@@ -957,16 +987,9 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         val uri = Uri.parse(uriString)
         when (val validation = safFileHandler.validateFile(uri)) {
             is SafFileHandler.FileValidationResult.Valid -> {
-                if (validation.fileType != VaultEngine.FILE_TYPE_VIDEO) {
-                    result.error("UNSUPPORTED_TYPE", "Streaming import only supports video files", null)
-                    return
-                }
                 scope.launch {
                     handleImportFileStreaming(uri, validation, sessionId, result)
                 }
-            }
-            is SafFileHandler.FileValidationResult.UnsupportedType -> {
-                result.error("UNSUPPORTED_TYPE", "File type not supported: ${validation.mimeType}", null)
             }
             is SafFileHandler.FileValidationResult.TooLarge -> {
                 result.error("FILE_TOO_LARGE", "File too large: ${validation.size} bytes (max 50GB)", null)
@@ -1071,7 +1094,13 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         
         scope.launch {
             vaultBridge.readFile(fileId).fold(
-                onSuccess = { data -> result.success(data) },
+                onSuccess = { data ->
+                    try {
+                        result.success(data)
+                    } finally {
+                        data.fill(0)
+                    }
+                },
                 onFailure = { e -> result.error("READ_FAILED", e.message, null) }
             )
         }
@@ -1090,11 +1119,15 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         scope.launch {
             vaultBridge.readTextPreview(fileId, maxBytes).fold(
                 onSuccess = { preview ->
-                    result.success(mapOf(
-                        "data" to preview.data,
-                        "truncated" to preview.truncated,
-                        "totalSize" to preview.totalSize
-                    ))
+                    try {
+                        result.success(mapOf(
+                            "data" to preview.data,
+                            "truncated" to preview.truncated,
+                            "totalSize" to preview.totalSize
+                        ))
+                    } finally {
+                        preview.data.fill(0)
+                    }
                 },
                 onFailure = { e -> result.error("READ_FAILED", e.message, null) }
             )
@@ -1127,7 +1160,11 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                         data.fill(0)
                     }
                 }
-                result.success(rendered)
+                try {
+                    result.success(rendered)
+                } finally {
+                    (rendered["png"] as? ByteArray)?.fill(0)
+                }
             } catch (e: Exception) {
                 SecureLog.e("VaultPlugin", "handleRenderPdfPage failed: ${e.message}")
                 result.error("PDF_RENDER_FAILED", e.message, null)
@@ -1172,13 +1209,20 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                                 Matrix().apply { postScale(scale, scale) },
                                 PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
                             )
-                            val output = ByteArrayOutputStream()
-                            bitmap.compress(Bitmap.CompressFormat.PNG, 90, output)
-                            return mapOf(
-                                "png" to output.toByteArray(),
-                                "pageIndex" to pageIndex,
-                                "pageCount" to pageCount
-                            )
+                            val output = object : ByteArrayOutputStream() {
+                                override fun close() {
+                                    buf.fill(0)
+                                    super.close()
+                                }
+                            }
+                            output.use {
+                                bitmap.compress(Bitmap.CompressFormat.PNG, 90, it)
+                                return mapOf(
+                                    "png" to it.toByteArray(),
+                                    "pageIndex" to pageIndex,
+                                    "pageCount" to pageCount
+                                )
+                            }
                         } finally {
                             bitmap.recycle()
                         }
@@ -1706,6 +1750,13 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 vaultEngine.secureWipeFile(tempFile.absolutePath)
                 return null
             }
+
+            val kdfInfo = vaultEngine.inspectVaultKdfInfo(tempFile.absolutePath)
+                .getOrElse {
+                    SecureLog.e("VaultPlugin", "importVaultFileFromUri: invalid KDF metadata")
+                    vaultEngine.secureWipeFile(tempFile.absolutePath)
+                    return null
+                }
             
             // Create registry entry and copy file
             val entry = vaultRegistry.createVaultEntry()
@@ -1760,12 +1811,12 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             SecureLog.d("VaultPlugin", "importVaultFileFromUri: success, vaultId=$vaultId, size=$finalSize, renamed=$renamed")
             
             val metadata = vaultRegistry.getVault(vaultId)
-            mapOf(
+            mutableMapOf<String, Any>(
                 "id" to vaultId,
                 "filename" to (metadata?.filename ?: ""),
                 "createdAt" to (metadata?.createdAt ?: System.currentTimeMillis()),
                 "sizeBytes" to finalSize
-            )
+            ).apply { putAll(kdfInfo) }
         } catch (e: Exception) {
             SecureLog.e("VaultPlugin", "Import vault file failed")
             // SECURITY: Clean up temp file on exception
@@ -2366,77 +2417,88 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
     }
 
     private fun handleVerifyPassword(call: MethodCall, result: MethodChannel.Result) {
-        val password = call.argument<String>("password")
-        if (password == null) {
-            result.error("INVALID_ARGUMENT", "password required", null)
-            return
-        }
+        val password = passwordBytes(call, "password", result) ?: return
         if (!securityManager.isEnvironmentSecure()) {
+            VaultEngine.secureZeroize(password)
             result.error("ENV_BLOCKED", "Environment not supported", null)
             return
         }
 
         val limiterVaultId = currentVaultId
-        
-        // SECURITY: Rate limiting to prevent brute-force
-        if (passwordRateLimiter.isLockedOut(limiterVaultId)) {
-            val remainingSecs = passwordRateLimiter.getRemainingLockoutMs(limiterVaultId) / 1000
-            result.error("RATE_LIMITED", "Too many attempts. Try again in ${remainingSecs}s", null)
-            return
-        }
-        
-        val backoffMs = passwordRateLimiter.getBackoffMs(limiterVaultId)
-        if (backoffMs > 0) {
-            result.error("RATE_LIMITED", "Wait ${backoffMs / 1000}s before next attempt", null)
+        if (rejectRateLimited(limiterVaultId, result)) {
+            VaultEngine.secureZeroize(password)
             return
         }
 
         scope.launch {
             try {
-                val verified = vaultBridge.verifyPassword(password)
-                if (verified) {
-                    passwordRateLimiter.recordSuccess(limiterVaultId)
-                } else {
-                    val remaining = passwordRateLimiter.recordFailure(limiterVaultId)
-                    if (remaining == -1) {
-                        SecureLog.security("VaultPlugin", "Password lockout activated")
+                vaultBridge.verifyPassword(password).fold(
+                    onSuccess = { verified ->
+                        if (verified) {
+                            passwordRateLimiter.recordSuccess(limiterVaultId)
+                            result.success(true)
+                        } else {
+                            reportAuthFailure(limiterVaultId, result)
+                        }
+                    },
+                    onFailure = { error ->
+                        reportVaultFailure(error, result, "VERIFY_FAILED")
                     }
-                }
-                result.success(verified)
+                )
             } catch (e: Exception) {
-                passwordRateLimiter.recordFailure(limiterVaultId)
-                result.success(false)
+                reportVaultFailure(e, result, "VERIFY_FAILED")
+            } finally {
+                VaultEngine.secureZeroize(password)
             }
         }
     }
 
     private fun handleChangePassword(call: MethodCall, result: MethodChannel.Result) {
-        val currentPassword = call.argument<String>("currentPassword")
-        val newPassword = call.argument<String>("newPassword")
-        
-        if (currentPassword == null || newPassword == null) {
-            result.error("INVALID_ARGUMENT", "currentPassword and newPassword required", null)
-            return
-        }
-        if (newPassword.length < 12) {
-            result.error("WEAK_PASSWORD", "New password must be at least 12 characters", null)
+        val currentPassword = passwordBytes(call, "currentPassword", result) ?: return
+        val newPassword = passwordBytes(call, "newPassword", result, MIN_PASSPHRASE_BYTES)
+        if (newPassword == null) {
+            VaultEngine.secureZeroize(currentPassword)
             return
         }
         if (!securityManager.isEnvironmentSecure()) {
+            VaultEngine.secureZeroize(currentPassword)
+            VaultEngine.secureZeroize(newPassword)
             result.error("ENV_BLOCKED", "Environment not supported", null)
             return
         }
         if (!vaultBridge.isVaultOpen()) {
+            VaultEngine.secureZeroize(currentPassword)
+            VaultEngine.secureZeroize(newPassword)
             result.error("VAULT_LOCKED", "Vault must be unlocked to change password", null)
+            return
+        }
+        val limiterVaultId = currentVaultId
+        if (rejectRateLimited(limiterVaultId, result)) {
+            VaultEngine.secureZeroize(currentPassword)
+            VaultEngine.secureZeroize(newPassword)
             return
         }
 
         scope.launch {
             try {
-                val success = vaultBridge.changePassword(currentPassword, newPassword)
-                result.success(success)
+                vaultBridge.changePassword(currentPassword, newPassword).fold(
+                    onSuccess = {
+                        passwordRateLimiter.recordSuccess(limiterVaultId)
+                        result.success(true)
+                    },
+                    onFailure = { error ->
+                        if (error is VaultException && error.isAuthError()) {
+                            reportAuthFailure(limiterVaultId, result)
+                        } else {
+                            reportVaultFailure(error, result, "CHANGE_FAILED")
+                        }
+                    }
+                )
             } catch (e: Exception) {
-                result.error("CHANGE_FAILED", e.message, null)
+                reportVaultFailure(e, result, "CHANGE_FAILED")
+            } finally {
+                VaultEngine.secureZeroize(currentPassword)
+                VaultEngine.secureZeroize(newPassword)
             }
         }
     }
@@ -2457,29 +2519,28 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
 
     private fun handleCreateVaultWithTitle(call: MethodCall, result: MethodChannel.Result) {
         val title = call.argument<String>("title")
-        val password = call.argument<String>("password")
-        
-        if (title == null || password == null) {
-            result.error("INVALID_ARGUMENT", "title and password required", null)
-            return
-        }
-        if (password.length < 12) {
-            result.error("WEAK_PASSWORD", "Password must be at least 12 characters", null)
+        val password = passwordBytes(call, "password", result, MIN_PASSPHRASE_BYTES) ?: return
+        if (title == null) {
+            VaultEngine.secureZeroize(password)
+            result.error("INVALID_ARGUMENT", "title required", null)
             return
         }
         if (!vaultRegistry.canAddVault()) {
+            VaultEngine.secureZeroize(password)
             result.error("MAX_VAULTS", "Maximum 25 vaults allowed", null)
             return
         }
         
         // Security check
         if (!securityManager.isEnvironmentSecure()) {
+            VaultEngine.secureZeroize(password)
             result.error("ENV_BLOCKED", "Environment not supported", null)
             return
         }
         
         val currentActivity = activity
         if (currentActivity == null) {
+            VaultEngine.secureZeroize(password)
             result.error("NO_ACTIVITY", "No activity available", null)
             return
         }
@@ -2496,8 +2557,6 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 val (vaultId, vaultPath) = entry
                 
                 // Create the actual vault file with the VaultEngine
-                val vaultEngine = VaultEngine.getInstance(currentActivity)
-                
                 // Initialize vault engine if not already
                 val initResult = vaultBridge.initialize()
                 if (initResult.isFailure) {
@@ -2516,7 +2575,11 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                     val openResult = vaultBridge.openVaultAtPath(vaultPath, password)
                     
                     if (openResult.isSuccess) {
-                        val importResult = vaultBridge.importFile(titleData, 1, "__vault_title__", "text/plain")
+                        val importResult = try {
+                            vaultBridge.importFile(titleData, 1, "__vault_title__", "text/plain")
+                        } finally {
+                            VaultEngine.secureZeroize(titleData)
+                        }
                         if (importResult.isFailure) {
                             SecureLog.e("VaultPlugin", "Failed to save title")
                         } else {
@@ -2524,6 +2587,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                         }
                         vaultBridge.closeVault()
                     } else {
+                        VaultEngine.secureZeroize(titleData)
                         SecureLog.e("VaultPlugin", "Failed to open vault for title: ${openResult.exceptionOrNull()?.message}")
                         // Vault was created but we couldn't save title - still return success
                         // Title will just be empty
@@ -2539,11 +2603,12 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                     ))
                 } else {
                     vaultRegistry.deleteVault(vaultId)
-                    val errorMsg = createResult.exceptionOrNull()?.message ?: "Unknown error during vault creation"
-                    result.error("CREATE_FAILED", errorMsg, null)
+                    reportVaultFailure(createResult.exceptionOrNull() ?: Exception("Vault creation failed"), result, "CREATE_FAILED")
                 }
             } catch (e: Exception) {
-                result.error("CREATE_FAILED", "Exception: ${e.message ?: e.javaClass.simpleName}", null)
+                reportVaultFailure(e, result, "CREATE_FAILED")
+            } finally {
+                VaultEngine.secureZeroize(password)
             }
         }
     }
@@ -2653,23 +2718,32 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             if (importResult != null) {
                 result.success(importResult)
             } else {
-                result.success(null)
+                result.error(
+                    "IMPORT_FAILED",
+                    "Vault file is invalid, corrupted, or could not be read",
+                    null
+                )
             }
         }
     }
 
     private fun handleGetVaultTitle(call: MethodCall, result: MethodChannel.Result) {
         val vaultId = call.argument<String>("vaultId")
-        val password = call.argument<String>("password")
-        
-        if (vaultId == null || password == null) {
-            result.error("INVALID_ARGUMENT", "vaultId and password required", null)
+        val password = passwordBytes(call, "password", result) ?: return
+        if (vaultId == null) {
+            VaultEngine.secureZeroize(password)
+            result.error("INVALID_ARGUMENT", "vaultId required", null)
             return
         }
 
         val vaultPath = vaultRegistry.getVaultPath(vaultId)
         if (vaultPath == null) {
+            VaultEngine.secureZeroize(password)
             result.error("NOT_FOUND", "Vault not found", null)
+            return
+        }
+        if (rejectRateLimited(vaultId, result)) {
+            VaultEngine.secureZeroize(password)
             return
         }
 
@@ -2677,10 +2751,19 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             var closeWhenDone = false
             try {
                 // Check if the requested vault is already open
-                val vaultEngine = VaultEngine.getInstance(activity!!)
-                val isAlreadyOpen = vaultBridge.isVaultOpen() && vaultEngine.getCurrentVaultPath() == vaultPath
+                val isAlreadyOpen = vaultBridge.isVaultOpen() &&
+                    vaultBridge.getCurrentVaultPath() == vaultPath
                 
-                if (!isAlreadyOpen) {
+                if (isAlreadyOpen) {
+                    val verified = vaultBridge.verifyPassword(password).getOrElse { error ->
+                        reportVaultFailure(error, result, "READ_FAILED")
+                        return@launch
+                    }
+                    if (!verified) {
+                        reportAuthFailure(vaultId, result)
+                        return@launch
+                    }
+                } else {
                     // Close any currently open vault first
                     if (vaultBridge.isVaultOpen()) {
                         vaultBridge.closeVault()
@@ -2688,11 +2771,17 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                     
                     val openResult = vaultBridge.openVaultAtPath(vaultPath, password)
                     if (openResult.isFailure) {
-                        result.error("AUTH_FAILED", "Incorrect password", null)
+                        val error = openResult.exceptionOrNull()!!
+                        if (error is VaultException && error.isAuthError()) {
+                            reportAuthFailure(vaultId, result)
+                        } else {
+                            reportVaultFailure(error, result, "READ_FAILED")
+                        }
                         return@launch
                     }
                     closeWhenDone = true
                 }
+                passwordRateLimiter.recordSuccess(vaultId)
                 
                 // Find the title file
                 val files = vaultBridge.listFiles().getOrNull()
@@ -2701,7 +2790,11 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 
                 val title = if (titleEntry != null) {
                     val titleData = vaultBridge.readFile(titleEntry.fileId).getOrNull()
-                    titleData?.toString(Charsets.UTF_8) ?: ""
+                    try {
+                        titleData?.toString(Charsets.UTF_8) ?: ""
+                    } finally {
+                        VaultEngine.secureZeroize(titleData)
+                    }
                 } else {
                     // No title entry = legacy vault, return empty string (not error)
                     ""
@@ -2712,23 +2805,30 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 result.error("READ_FAILED", e.message, null)
             } finally {
                 if (closeWhenDone) vaultBridge.closeVault()
+                VaultEngine.secureZeroize(password)
             }
         }
     }
 
     private fun handleSetVaultTitle(call: MethodCall, result: MethodChannel.Result) {
         val vaultId = call.argument<String>("vaultId")
-        val password = call.argument<String>("password")
+        val password = passwordBytes(call, "password", result) ?: return
         val newTitle = call.argument<String>("newTitle")
         
-        if (vaultId == null || password == null || newTitle == null) {
-            result.error("INVALID_ARGUMENT", "vaultId, password, and newTitle required", null)
+        if (vaultId == null || newTitle == null) {
+            VaultEngine.secureZeroize(password)
+            result.error("INVALID_ARGUMENT", "vaultId and newTitle required", null)
             return
         }
 
         val vaultPath = vaultRegistry.getVaultPath(vaultId)
         if (vaultPath == null) {
+            VaultEngine.secureZeroize(password)
             result.error("NOT_FOUND", "Vault not found", null)
+            return
+        }
+        if (rejectRateLimited(vaultId, result)) {
+            VaultEngine.secureZeroize(password)
             return
         }
 
@@ -2736,10 +2836,19 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             var closeWhenDone = false
             try {
                 // Check if the requested vault is already open
-                val vaultEngine = VaultEngine.getInstance(activity!!)
-                val isAlreadyOpen = vaultBridge.isVaultOpen() && vaultEngine.getCurrentVaultPath() == vaultPath
+                val isAlreadyOpen = vaultBridge.isVaultOpen() &&
+                    vaultBridge.getCurrentVaultPath() == vaultPath
                 
-                if (!isAlreadyOpen) {
+                if (isAlreadyOpen) {
+                    val verified = vaultBridge.verifyPassword(password).getOrElse { error ->
+                        reportVaultFailure(error, result, "UPDATE_FAILED")
+                        return@launch
+                    }
+                    if (!verified) {
+                        reportAuthFailure(vaultId, result)
+                        return@launch
+                    }
+                } else {
                     // Close any currently open vault first
                     if (vaultBridge.isVaultOpen()) {
                         vaultBridge.closeVault()
@@ -2748,11 +2857,17 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                     val openResult = vaultBridge.openVaultAtPath(vaultPath, password)
                     if (openResult.isFailure) {
                         SecureLog.e("VaultPlugin", "Failed to open vault for title update")
-                        result.error("AUTH_FAILED", "Incorrect password", null)
+                        val error = openResult.exceptionOrNull()!!
+                        if (error is VaultException && error.isAuthError()) {
+                            reportAuthFailure(vaultId, result)
+                        } else {
+                            reportVaultFailure(error, result, "UPDATE_FAILED")
+                        }
                         return@launch
                     }
                     closeWhenDone = true
                 }
+                passwordRateLimiter.recordSuccess(vaultId)
                 
                 val files = vaultBridge.listFiles().getOrThrow()
                 var titleEntry = files.find { it.name == "__vault_title__" }
@@ -2796,116 +2911,80 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 result.error("UPDATE_FAILED", e.message, null)
             } finally {
                 if (closeWhenDone) vaultBridge.closeVault()
+                VaultEngine.secureZeroize(password)
             }
         }
     }
 
     private fun handleDeleteVaultById(call: MethodCall, result: MethodChannel.Result) {
         val vaultId = call.argument<String>("vaultId")
-        val password = call.argument<String>("password")
-        
-        if (vaultId == null || password == null) {
-            result.error("INVALID_ARGUMENT", "vaultId and password required", null)
+        val password = passwordBytes(call, "password", result) ?: return
+        if (vaultId == null) {
+            VaultEngine.secureZeroize(password)
+            result.error("INVALID_ARGUMENT", "vaultId required", null)
             return
         }
         if (!securityManager.isEnvironmentSecure()) {
+            VaultEngine.secureZeroize(password)
             result.error("ENV_BLOCKED", "Environment not supported", null)
             return
         }
         val vaultPath = vaultRegistry.getVaultPath(vaultId)
         if (vaultPath == null) {
+            VaultEngine.secureZeroize(password)
             result.error("NOT_FOUND", "Vault not found", null)
             return
         }
 
-        if (passwordRateLimiter.isLockedOut(vaultId)) {
-            val remainingSecs = passwordRateLimiter.getRemainingLockoutMs(vaultId) / 1000
-            result.error(
-                "RATE_LIMITED",
-                "Too many attempts. Try again in ${remainingSecs}s",
-                mapOf("remainingSeconds" to remainingSecs)
-            )
-            return
-        }
-        val backoffMs = passwordRateLimiter.getBackoffMs(vaultId)
-        if (backoffMs > 0) {
-            val remainingSecs = backoffMs / 1000
-            result.error(
-                "RATE_LIMITED",
-                "Wait ${remainingSecs}s before next attempt",
-                mapOf("remainingSeconds" to remainingSecs)
-            )
+        if (rejectRateLimited(vaultId, result)) {
+            VaultEngine.secureZeroize(password)
             return
         }
 
         scope.launch {
-            val wasOpenTarget = currentVaultId == vaultId && vaultBridge.isVaultOpen()
-            if (!wasOpenTarget && vaultBridge.isVaultOpen()) {
-                vaultBridge.closeVault()
-            }
-            val verified = vaultBridge.openVaultAtPath(vaultPath, password).isSuccess
-            if (vaultBridge.isVaultOpen()) {
-                vaultBridge.closeVault()
-            }
-            if (!verified) {
-                val remaining = passwordRateLimiter.recordFailure(vaultId)
-                if (remaining == -1) {
-                    val remainingSecs = passwordRateLimiter.getRemainingLockoutMs(vaultId) / 1000
-                    result.error(
-                        "RATE_LIMITED",
-                        "Too many attempts. Try again in ${remainingSecs}s",
-                        mapOf("remainingSeconds" to remainingSecs)
-                    )
-                } else {
-                    result.error(
-                        "AUTH_FAILED",
-                        "Incorrect password. $remaining attempts remaining",
-                        mapOf("attemptsRemaining" to remaining)
-                    )
+            try {
+                if (vaultBridge.isVaultOpen()) vaultBridge.closeVault()
+                val openResult = vaultBridge.openVaultAtPath(vaultPath, password)
+                if (vaultBridge.isVaultOpen()) vaultBridge.closeVault()
+                if (openResult.isFailure) {
+                    val error = openResult.exceptionOrNull()!!
+                    if (error is VaultException && error.isAuthError()) {
+                        reportAuthFailure(vaultId, result)
+                    } else {
+                        reportVaultFailure(error, result, "DELETE_FAILED")
+                    }
+                    return@launch
                 }
-                return@launch
+                passwordRateLimiter.recordSuccess(vaultId)
+                val success = vaultRegistry.deleteVault(vaultId)
+                if (currentVaultId == vaultId) currentVaultId = null
+                result.success(success)
+            } catch (e: Exception) {
+                reportVaultFailure(e, result, "DELETE_FAILED")
+            } finally {
+                VaultEngine.secureZeroize(password)
             }
-            passwordRateLimiter.recordSuccess(vaultId)
-            val success = vaultRegistry.deleteVault(vaultId)
-            if (currentVaultId == vaultId) currentVaultId = null
-            result.success(success)
         }
     }
 
     private fun handleOpenVaultById(call: MethodCall, result: MethodChannel.Result) {
         val vaultId = call.argument<String>("vaultId")
-        val password = call.argument<String>("password")
-        
-        if (vaultId == null || password == null) {
-            result.error("INVALID_ARGUMENT", "vaultId and password required", null)
+        val password = passwordBytes(call, "password", result) ?: return
+        if (vaultId == null) {
+            VaultEngine.secureZeroize(password)
+            result.error("INVALID_ARGUMENT", "vaultId required", null)
             return
         }
 
         val vaultPath = vaultRegistry.getVaultPath(vaultId)
         if (vaultPath == null) {
+            VaultEngine.secureZeroize(password)
             result.error("NOT_FOUND", "Vault not found", null)
             return
         }
 
-        // SECURITY: Rate limiting to prevent brute-force
-        if (passwordRateLimiter.isLockedOut(vaultId)) {
-            val remainingSecs = passwordRateLimiter.getRemainingLockoutMs(vaultId) / 1000
-            result.error(
-                "RATE_LIMITED",
-                "Too many attempts. Try again in ${remainingSecs}s",
-                mapOf("remainingSeconds" to remainingSecs)
-            )
-            return
-        }
-
-        val backoffMs = passwordRateLimiter.getBackoffMs(vaultId)
-        if (backoffMs > 0) {
-            val remainingSecs = backoffMs / 1000
-            result.error(
-                "RATE_LIMITED",
-                "Wait ${remainingSecs}s before next attempt",
-                mapOf("remainingSeconds" to remainingSecs)
-            )
+        if (rejectRateLimited(vaultId, result)) {
+            VaultEngine.secureZeroize(password)
             return
         }
 
@@ -2915,43 +2994,25 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 vaultBridge.closeVault()
             }
 
-            vaultBridge.openVaultAtPath(vaultPath, password).fold(
-                onSuccess = {
-                    currentVaultId = vaultId
-                    result.success(true)
-                },
-                onFailure = { e ->
-                    if (e is VaultException && e.isAuthError()) {
-                        val remaining = passwordRateLimiter.recordFailure(vaultId)
-                        if (remaining == -1) {
-                            val remainingSecs = passwordRateLimiter.getRemainingLockoutMs(vaultId) / 1000
-                            result.error(
-                                "RATE_LIMITED",
-                                "Too many attempts. Try again in ${remainingSecs}s",
-                                mapOf("remainingSeconds" to remainingSecs)
-                            )
+            try {
+                vaultBridge.openVaultAtPath(vaultPath, password).fold(
+                    onSuccess = {
+                        currentVaultId = vaultId
+                        result.success(true)
+                    },
+                    onFailure = { e ->
+                        if (e is VaultException && e.isAuthError()) {
+                            reportAuthFailure(vaultId, result)
                         } else {
-                            result.error(
-                                "AUTH_FAILED",
-                                "Incorrect password",
-                                mapOf("remainingAttempts" to remaining)
-                            )
+                            reportVaultFailure(e, result, "OPEN_FAILED")
                         }
-                        return@fold
                     }
-                    val code = when {
-                        e.message?.contains("Authentication") == true -> "AUTH_FAILED"
-                        e.message?.contains("corrupted") == true -> "CORRUPTED"
-                        else -> "OPEN_FAILED"
-                    }
-                    val message = when (code) {
-                        "AUTH_FAILED" -> "Incorrect password"
-                        "CORRUPTED" -> "Vault file is corrupted"
-                        else -> e.message ?: "Failed to open vault"
-                    }
-                    result.error(code, message, null)
-                }
-            )
+                )
+            } catch (e: Exception) {
+                reportVaultFailure(e, result, "OPEN_FAILED")
+            } finally {
+                VaultEngine.secureZeroize(password)
+            }
         }
     }
 

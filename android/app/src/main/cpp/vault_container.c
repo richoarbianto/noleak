@@ -188,16 +188,82 @@ static int journal_select_slot(int fd, const vault_journal_super_t *super,
 
 static int validate_kdf_params(uint32_t mem_limit, uint32_t iterations,
                                uint32_t parallel) {
-  if (mem_limit < VAULT_KDF_MEM_LOW || mem_limit > VAULT_KDF_MEM_HIGH) {
-    return 0;
+  return vault_kdf_params_valid(mem_limit, iterations, parallel);
+}
+
+int vault_inspect_kdf_params(const char *path, uint32_t *mem_out,
+                             uint32_t *iter_out, uint32_t *parallel_out) {
+  if (!path || !mem_out || !iter_out || !parallel_out)
+    return VAULT_ERR_INVALID_PARAM;
+
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return VAULT_ERR_IO;
+
+  int result = VAULT_OK;
+  uint32_t memory = 0;
+  uint32_t iterations = 0;
+  uint32_t parallelism = 0;
+  uint8_t magic[VAULT_MAGIC_LEN];
+
+  if (pread(fd, magic, sizeof(magic), 0) != sizeof(magic)) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
   }
-  if (iterations < VAULT_KDF_ITER_LOW || iterations > VAULT_KDF_ITER_HIGH) {
-    return 0;
+
+  if (memcmp(magic, VAULT_JOURNAL_MAGIC, VAULT_MAGIC_LEN) == 0) {
+    vault_journal_super_t super;
+    vault_journal_slot_t slot;
+    result = journal_read_super(fd, &super);
+    if (result != VAULT_OK)
+      goto cleanup;
+    result = journal_select_slot(fd, &super, &slot);
+    if (result != VAULT_OK)
+      goto cleanup;
+    memory = slot.kdf_mem;
+    iterations = slot.kdf_iter;
+    parallelism = slot.kdf_parallel;
+  } else if (memcmp(magic, VAULT_MAGIC, VAULT_MAGIC_LEN) == 0) {
+    vault_header_t header;
+    if (pread(fd, &header, sizeof(header), 0) != sizeof(header)) {
+      result = VAULT_ERR_IO;
+      goto cleanup;
+    }
+    if (header.version != VAULT_VERSION ||
+        header.wrapped_mk_len != WRAPPED_MK_SIZE) {
+      result = VAULT_ERR_CORRUPTED;
+      goto cleanup;
+    }
+
+    uint32_t stored_crc;
+    off_t crc_offset = (off_t)sizeof(header) + (off_t)header.wrapped_mk_len;
+    if (pread(fd, &stored_crc, sizeof(stored_crc), crc_offset) !=
+            sizeof(stored_crc) ||
+        stored_crc != calculate_crc32((const uint8_t *)&header,
+                                      sizeof(header))) {
+      result = VAULT_ERR_CORRUPTED;
+      goto cleanup;
+    }
+    memory = header.kdf_mem;
+    iterations = header.kdf_iter;
+    parallelism = header.kdf_parallel;
+  } else {
+    result = VAULT_ERR_CORRUPTED;
+    goto cleanup;
   }
-  if (parallel < VAULT_KDF_PARALLEL_LOW || parallel > 2) {
-    return 0;
+
+  if (!validate_kdf_params(memory, iterations, parallelism)) {
+    result = VAULT_ERR_CORRUPTED;
+    goto cleanup;
   }
-  return 1;
+
+  *mem_out = memory;
+  *iter_out = iterations;
+  *parallel_out = parallelism;
+
+cleanup:
+  close(fd);
+  return result;
 }
 
 static void fsync_parent_dir(const char *path) {
@@ -1391,6 +1457,7 @@ static int read_index(int fd, const uint8_t mk[VAULT_KEY_LEN]) {
   free(ciphertext);
 
   if (result != VAULT_OK) {
+    vault_zeroize(plaintext, pt_len);
     free(plaintext);
     return result;
   }
@@ -1408,6 +1475,7 @@ static int read_index(int fd, const uint8_t mk[VAULT_KEY_LEN]) {
     g_vault.entry_count = count;
   }
 
+  vault_zeroize(plaintext, pt_len);
   free(plaintext);
   return result;
 }
@@ -1696,6 +1764,34 @@ cleanup_buffers:
   if (temp_path) {
     free(temp_path);
   }
+  return result;
+}
+
+int vault_verify_password(const uint8_t *passphrase, size_t pass_len) {
+  if (!passphrase || pass_len == 0) {
+    return VAULT_ERR_INVALID_PARAM;
+  }
+  if (!g_vault.is_open) {
+    return VAULT_ERR_NOT_OPEN;
+  }
+
+  uint8_t kek[VAULT_KEY_LEN];
+  uint8_t candidate_mk[VAULT_KEY_LEN];
+  size_t candidate_len = 0;
+  int result = vault_kdf_derive_with_params(
+      passphrase, pass_len, g_vault.salt, g_vault.kdf_mem,
+      g_vault.kdf_iter, kek);
+  if (result == VAULT_OK) {
+    result = vault_aead_decrypt(
+        kek, g_vault.wrapped_mk, g_vault.vault_id, VAULT_ID_LEN,
+        g_vault.wrapped_mk + VAULT_NONCE_LEN,
+        VAULT_KEY_LEN + VAULT_TAG_LEN, candidate_mk, &candidate_len);
+    if (result != VAULT_OK || candidate_len != VAULT_KEY_LEN) {
+      result = VAULT_ERR_AUTH_FAIL;
+    }
+  }
+  vault_zeroize(kek, sizeof(kek));
+  vault_zeroize(candidate_mk, sizeof(candidate_mk));
   return result;
 }
 

@@ -510,27 +510,7 @@ int vault_get_stats(uint64_t *total_size_out, uint64_t *free_space_out) {
 // ========================================================================
 
 static void clear_entry_allocations(vault_entry_t *entry) {
-  if (!entry)
-    return;
-  if (entry->name) {
-    free(entry->name);
-    entry->name = NULL;
-  }
-  if (entry->mime) {
-    free(entry->mime);
-    entry->mime = NULL;
-  }
-  if (entry->wrapped_dek) {
-    vault_zeroize(entry->wrapped_dek, entry->wrapped_dek_len);
-    free(entry->wrapped_dek);
-    entry->wrapped_dek = NULL;
-    entry->wrapped_dek_len = 0;
-  }
-  if (entry->chunks) {
-    free(entry->chunks);
-    entry->chunks = NULL;
-  }
-  entry->chunk_count = 0;
+  vault_free_entry(entry);
 }
 
 void free_entries_array(vault_entry_t *entries, uint32_t count) {

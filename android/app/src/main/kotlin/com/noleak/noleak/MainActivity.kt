@@ -1,9 +1,11 @@
 package com.noleak.noleak
 
 import android.content.ComponentCallbacks2
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.MotionEvent
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -52,6 +54,22 @@ class MainActivity : FlutterFragmentActivity() {
             WindowManager.LayoutParams.FLAG_SECURE,
             WindowManager.LayoutParams.FLAG_SECURE
         )
+
+        // Block non-system overlays on Android 12+.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            window.setHideOverlayWindows(true)
+        }
+    }
+
+    /**
+     * SECURITY: Reject touches delivered through full or partial overlays.
+     */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        val obscured = event.flags and MotionEvent.FLAG_WINDOW_IS_OBSCURED != 0
+        val partiallyObscured = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            event.flags and MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED != 0
+
+        return if (obscured || partiallyObscured) true else super.dispatchTouchEvent(event)
     }
     
     override fun onResume() {

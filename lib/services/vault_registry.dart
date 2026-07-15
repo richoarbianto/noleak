@@ -55,7 +55,7 @@ class VaultRegistry extends ChangeNotifier {
   /// Create a new vault with encrypted title
   Future<bool> createVault({
     required String title,
-    required String password,
+    required Uint8List password,
   }) async {
     if (!canAddVault) {
       _error = 'Maximum $maxVaults vaults reached';
@@ -134,7 +134,7 @@ class VaultRegistry extends ChangeNotifier {
   /// Get decrypted title for a vault (requires password)
   /// Returns empty string for legacy vaults without title
   /// Throws exception on auth failure
-  Future<String?> revealTitle(String vaultId, String password) async {
+  Future<String?> revealTitle(String vaultId, Uint8List password) async {
     // This will throw PlatformException if auth fails
     return await VaultChannel.getVaultTitle(
         vaultId: vaultId, password: password);
@@ -142,36 +142,25 @@ class VaultRegistry extends ChangeNotifier {
 
   /// Update vault title (requires password)
   Future<bool> updateTitle(
-      String vaultId, String password, String newTitle) async {
-    try {
-      final success = await VaultChannel.setVaultTitle(
-        vaultId: vaultId,
-        password: password,
-        newTitle: newTitle,
-      );
-      return success;
-    } catch (e) {
-      return false;
-    }
+      String vaultId, Uint8List password, String newTitle) async {
+    return await VaultChannel.setVaultTitle(
+      vaultId: vaultId,
+      password: password,
+      newTitle: newTitle,
+    );
   }
 
   /// Delete a vault completely
-  Future<bool> deleteVault(String vaultId, String password) async {
-    try {
-      final success = await VaultChannel.deleteVault(
-        vaultId: vaultId,
-        password: password,
-      );
-      if (success) {
-        _vaults.removeWhere((v) => v.id == vaultId);
-        notifyListeners();
-      }
-      return success;
-    } catch (e) {
-      _error = e.toString();
+  Future<bool> deleteVault(String vaultId, Uint8List password) async {
+    final success = await VaultChannel.deleteVault(
+      vaultId: vaultId,
+      password: password,
+    );
+    if (success) {
+      _vaults.removeWhere((v) => v.id == vaultId);
       notifyListeners();
-      return false;
     }
+    return success;
   }
 
   /// Set current active vault

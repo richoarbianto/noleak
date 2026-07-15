@@ -31,20 +31,28 @@ extern "C" {
 #define VAULT_HASH_LEN 32 // SHA256 hash length
 
 // KDF Profiles for different device capabilities
+// libsodium crypto_pwhash() fixes Argon2id parallelism at 1. Older NoLeak
+// builds wrote 2 into the header without passing it to libsodium, so 2 remains
+// accepted as legacy metadata only.
+#define VAULT_KDF_PARALLEL_EFFECTIVE 1
+#define VAULT_KDF_PARALLEL_LEGACY_COMPAT 2
+
 // Profile 0: High-end (4GB+ RAM) - Maximum security
 #define VAULT_KDF_MEM_HIGH (256 * 1024 * 1024) // 256 MB
-#define VAULT_KDF_ITER_HIGH 12
-#define VAULT_KDF_PARALLEL_HIGH 1
+#define VAULT_KDF_ITER_HIGH 3
+#define VAULT_KDF_PARALLEL_HIGH VAULT_KDF_PARALLEL_EFFECTIVE
 
 // Profile 1: Medium (2-4GB RAM) - Good balance
 #define VAULT_KDF_MEM_MEDIUM (128 * 1024 * 1024) // 128 MB
-#define VAULT_KDF_ITER_MEDIUM 10
-#define VAULT_KDF_PARALLEL_MEDIUM 1
+#define VAULT_KDF_ITER_MEDIUM 3
+#define VAULT_KDF_PARALLEL_MEDIUM VAULT_KDF_PARALLEL_EFFECTIVE
 
 // Profile 2: Low-end (<2GB RAM) - Lighter for weak devices
-#define VAULT_KDF_MEM_LOW (32 * 1024 * 1024) // 32 MB
+#define VAULT_KDF_MEM_LOW (64 * 1024 * 1024) // 64 MB
+#define VAULT_KDF_MEM_MIN_COMPAT (32 * 1024 * 1024) // Legacy vaults
 #define VAULT_KDF_ITER_LOW 3
-#define VAULT_KDF_PARALLEL_LOW 1
+#define VAULT_KDF_ITER_MAX_COMPAT 12
+#define VAULT_KDF_PARALLEL_LOW VAULT_KDF_PARALLEL_EFFECTIVE
 
 // Default values (will be overridden by adaptive selection)
 #define VAULT_KDF_MEM VAULT_KDF_MEM_HIGH
@@ -58,6 +66,28 @@ typedef enum {
   KDF_PROFILE_MEDIUM = 2,
   KDF_PROFILE_LOW = 3
 } vault_kdf_profile_t;
+
+static inline vault_kdf_profile_t
+vault_select_kdf_profile(size_t total_ram_mb, size_t available_ram_mb,
+                         int is_low_ram_device, int is_64_bit_process) {
+  if (is_low_ram_device || !is_64_bit_process || total_ram_mb < 3072 ||
+      available_ram_mb < 512) {
+    return KDF_PROFILE_LOW;
+  }
+  if (total_ram_mb < 6144 || available_ram_mb < 1024) {
+    return KDF_PROFILE_MEDIUM;
+  }
+  return KDF_PROFILE_HIGH;
+}
+
+static inline int vault_kdf_params_valid(uint32_t memory, uint32_t iterations,
+                                         uint32_t parallelism) {
+  return memory >= VAULT_KDF_MEM_MIN_COMPAT &&
+         memory <= VAULT_KDF_MEM_HIGH && iterations >= VAULT_KDF_ITER_LOW &&
+         iterations <= VAULT_KDF_ITER_MAX_COMPAT &&
+         (parallelism == VAULT_KDF_PARALLEL_EFFECTIVE ||
+          parallelism == VAULT_KDF_PARALLEL_LEGACY_COMPAT);
+}
 
 #define VAULT_CHUNK_SIZE (1024 * 1024) // 1 MB
 
@@ -167,8 +197,11 @@ int vault_init(void);
  * Set KDF profile based on device capabilities
  * SECURITY: Called once at init with device RAM size
  * @param total_ram_mb Device total RAM in megabytes
+ * @param available_ram_mb Currently available RAM in megabytes
  */
-void vault_set_kdf_profile_by_ram(size_t total_ram_mb);
+void vault_set_kdf_profile_by_ram(size_t total_ram_mb, size_t available_ram_mb,
+                                  int is_low_ram_device,
+                                  int is_64_bit_process);
 
 /**
  * Get current KDF parameters (for debugging/logging)
@@ -304,6 +337,16 @@ int vault_create(const char *path, const uint8_t *passphrase, size_t pass_len);
  * @return VAULT_OK on success, VAULT_ERR_AUTH_FAIL if wrong passphrase
  */
 int vault_open(const char *path, const uint8_t *passphrase, size_t pass_len);
+
+/**
+ * Read and validate the KDF parameters stored in a vault header.
+ * This does not derive a key or decrypt vault contents.
+ */
+int vault_inspect_kdf_params(const char *path, uint32_t *mem_out,
+                             uint32_t *iter_out, uint32_t *parallel_out);
+
+/** Verify a passphrase against the currently open vault without changing state. */
+int vault_verify_password(const uint8_t *passphrase, size_t pass_len);
 
 /**
  * Close the vault and zeroize all keys

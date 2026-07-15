@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
@@ -43,8 +42,6 @@ class VaultStateManager extends ChangeNotifier {
 
   // Constants
   static const int maxFailedAttempts = 5;
-  static const int baseLockoutSeconds = 60;
-  static const int maxLockoutSeconds = 30 * 60; // 30 minutes
   static const String _folderMapName = '__folder_map__';
   static const String _folderMapTempName = '__folder_map__.tmp';
   static const int _folderMapVersion = 1;
@@ -111,7 +108,7 @@ class VaultStateManager extends ChangeNotifier {
   }
 
   /// Create a new vault
-  Future<void> createVault(String passphrase) async {
+  Future<void> createVault(Uint8List passphrase) async {
     // Security check before vault creation (PRD Req 2.3)
     await _checkSecurity();
 
@@ -121,14 +118,9 @@ class VaultStateManager extends ChangeNotifier {
   }
 
   /// Unlock vault with passphrase
-  Future<bool> unlockVault(String passphrase) async {
+  Future<bool> unlockVault(Uint8List passphrase) async {
     // Security check before unlock (PRD Req 2.4)
     await _checkSecurity();
-
-    if (isLockedOut) {
-      throw Exception(
-          'Too many failed attempts. Try again in $lockoutRemainingSeconds seconds.');
-    }
 
     var vaultOpened = false;
     var unlockCompleted = false;
@@ -160,11 +152,10 @@ class VaultStateManager extends ChangeNotifier {
       if (e.code == 'RATE_LIMITED') {
         _applyRateLimit(e);
       } else {
-        _handleFailedAttempt();
+        _applyAuthFailure(e);
       }
       rethrow;
     } catch (e) {
-      _handleFailedAttempt();
       rethrow;
     } finally {
       if (vaultOpened && !unlockCompleted) {
@@ -179,7 +170,7 @@ class VaultStateManager extends ChangeNotifier {
 
   /// Unlock a specific vault by ID (multi-vault mode)
   /// Called after VaultChannel.openVaultById has already succeeded
-  Future<void> unlockVaultById(String vaultId, {String? password}) async {
+  Future<void> unlockVaultById(String vaultId) async {
     SecureLogger.d('VaultStateManager', 'unlockVaultById called for: $vaultId');
     _currentVaultId = vaultId;
 
@@ -309,20 +300,14 @@ class VaultStateManager extends ChangeNotifier {
     await VaultChannel.closeVault();
   }
 
-  /// Handle failed unlock attempt
-  void _handleFailedAttempt() {
-    _failedAttempts++;
-
-    if (_failedAttempts >= maxFailedAttempts) {
-      // Calculate lockout duration with exponential backoff
-      final lockoutMultiplier = _failedAttempts - maxFailedAttempts + 1;
-      var lockoutSeconds = baseLockoutSeconds * (1 << (lockoutMultiplier - 1));
-      lockoutSeconds =
-          lockoutSeconds.clamp(baseLockoutSeconds, maxLockoutSeconds);
-
-      _lockoutUntil = DateTime.now().add(Duration(seconds: lockoutSeconds));
+  void _applyAuthFailure(PlatformException e) {
+    final details = e.details;
+    final remaining = details is Map
+        ? details['remainingAttempts'] ?? details['attemptsRemaining']
+        : null;
+    if (remaining is int) {
+      _failedAttempts = maxFailedAttempts - remaining;
     }
-
     notifyListeners();
   }
 
@@ -335,8 +320,7 @@ class VaultStateManager extends ChangeNotifier {
     if (remainingSeconds != null && remainingSeconds > 0) {
       _lockoutUntil = DateTime.now().add(Duration(seconds: remainingSeconds));
     } else {
-      _lockoutUntil =
-          DateTime.now().add(const Duration(seconds: baseLockoutSeconds));
+      _lockoutUntil = DateTime.now().add(const Duration(seconds: 60));
     }
     _failedAttempts = maxFailedAttempts;
     notifyListeners();

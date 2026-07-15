@@ -1,13 +1,13 @@
 /// StreamingImportService - Large File Import Handler
-/// 
+///
 /// Handles streaming import of large files to avoid memory exhaustion.
 /// Files are imported in chunks (1MB each) and encrypted incrementally.
-/// 
+///
 /// Features:
 /// - Progress tracking via [progressStream]
 /// - Resume support for interrupted imports
 /// - Abort capability for pending imports
-/// 
+///
 /// The service uses EventChannel to receive progress updates from
 /// native code during the import process.
 
@@ -15,7 +15,7 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 
 /// Progress data for an ongoing file import operation.
-/// 
+///
 /// Contains information about:
 /// - [importId]: Unique identifier for this import operation
 /// - [bytesWritten]: Bytes processed so far
@@ -114,29 +114,32 @@ class PendingImport {
 
   String get sizeText {
     if (fileSize < 1024) return '$fileSize B';
-    if (fileSize < 1024 * 1024) return '${(fileSize / 1024).toStringAsFixed(1)} KB';
-    if (fileSize < 1024 * 1024 * 1024) return '${(fileSize / (1024 * 1024)).toStringAsFixed(1)} MB';
+    if (fileSize < 1024 * 1024)
+      return '${(fileSize / 1024).toStringAsFixed(1)} KB';
+    if (fileSize < 1024 * 1024 * 1024)
+      return '${(fileSize / (1024 * 1024)).toStringAsFixed(1)} MB';
     return '${(fileSize / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 }
 
-
 /// Service for streaming file imports with progress tracking and resume support
 class StreamingImportService {
   static const _channel = MethodChannel('com.noleak.vault');
-  static const _progressChannel = EventChannel('com.noleak.vault/import_progress');
-  
+  static const _progressChannel =
+      EventChannel('com.noleak.vault/import_progress');
+
   static StreamingImportService? _instance;
-  static StreamingImportService get instance => _instance ??= StreamingImportService._();
-  
+  static StreamingImportService get instance =>
+      _instance ??= StreamingImportService._();
+
   StreamingImportService._();
-  
+
   StreamSubscription? _progressSubscription;
   final _progressController = StreamController<ImportProgress>.broadcast();
-  
+
   /// Stream of import progress updates
   Stream<ImportProgress> get progressStream => _progressController.stream;
-  
+
   /// Initialize the service and listen for progress events
   void initialize() {
     _progressSubscription?.cancel();
@@ -151,18 +154,19 @@ class StreamingImportService {
       },
     );
   }
-  
+
   /// Dispose the service
   void dispose() {
     _progressSubscription?.cancel();
     _progressController.close();
   }
-  
+
   /// Import a file using streaming (for large files)
   /// Returns the file ID on success
   Future<Map<String, dynamic>?> importFileStreaming(String uri) async {
     try {
-      final result = await _channel.invokeMethod('importFileStreaming', {'uri': uri});
+      final result =
+          await _channel.invokeMethod('importFileStreaming', {'uri': uri});
       if (result is Map) {
         return Map<String, dynamic>.from(result);
       }
@@ -171,7 +175,7 @@ class StreamingImportService {
       throw ImportException(e.code, e.message ?? 'Import failed');
     }
   }
-  
+
   /// Get list of pending imports that can be resumed
   Future<List<PendingImport>> listPendingImports() async {
     try {
@@ -184,17 +188,18 @@ class StreamingImportService {
       return [];
     }
   }
-  
+
   /// Abort a pending import
   Future<bool> abortImport(List<int> importId) async {
     try {
-      final result = await _channel.invokeMethod('abortImport', {'importId': importId});
+      final result =
+          await _channel.invokeMethod('abortImport', {'importId': importId});
       return result == true;
     } on PlatformException {
       return false;
     }
   }
-  
+
   /// Check if there are any pending imports
   Future<bool> hasPendingImports() async {
     final pending = await listPendingImports();
@@ -206,14 +211,13 @@ class StreamingImportService {
 class ImportException implements Exception {
   final String code;
   final String message;
-  
+
   ImportException(this.code, this.message);
-  
+
   @override
   String toString() => 'ImportException($code): $message';
-  
+
   bool get isFileTooLarge => code == 'FILE_TOO_LARGE';
-  bool get isUnsupportedType => code == 'UNSUPPORTED_TYPE';
   bool get isVaultNotOpen => code == 'VAULT_NOT_OPEN';
   bool get isDiskFull => code == 'DISK_FULL';
 }

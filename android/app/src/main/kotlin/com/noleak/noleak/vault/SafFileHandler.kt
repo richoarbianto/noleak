@@ -3,6 +3,7 @@ package com.noleak.noleak.vault
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.webkit.MimeTypeMap
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.security.SecureRandom
@@ -18,22 +19,7 @@ import java.security.SecureRandom
 class SafFileHandler(private val context: Context) {
     
     companion object {
-        // Supported MIME types
-        val SUPPORTED_MIME_TYPES = setOf(
-            "text/plain",
-            "image/jpeg",
-            "image/png",
-            "image/webp",
-            "video/mp4",
-            "video/x-matroska",
-            "audio/mpeg",
-            "audio/mp4",
-            "audio/aac",
-            "audio/wav",
-            "audio/x-wav",
-            "audio/ogg",
-            "audio/opus",
-            "audio/flac",
+        private val DEDICATED_PREVIEW_MIME_TYPES = setOf(
             "application/pdf",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -44,23 +30,18 @@ class SafFileHandler(private val context: Context) {
             "application/pkcs8"
         )
 
-        private val EXTENSION_MIME_MAP = mapOf(
-            "txt" to "text/plain",
-            "pdf" to "application/pdf",
-            "docx" to "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "xlsx" to "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "pptx" to "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            "mp3" to "audio/mpeg",
-            "m4a" to "audio/mp4",
-            "aac" to "audio/aac",
-            "wav" to "audio/wav",
-            "ogg" to "audio/ogg",
-            "opus" to "audio/opus",
-            "flac" to "audio/flac",
+        private val SPECIAL_EXTENSION_MIME_TYPES = mapOf(
             "pem" to "application/x-pem-file",
             "key" to "application/x-pem-file",
             "pub" to "application/x-ssh-key",
             "asc" to "application/pgp-keys"
+        )
+
+        private val BOUNDED_TEXT_MIME_TYPES = setOf(
+            "application/x-pem-file",
+            "application/pgp-keys",
+            "application/x-ssh-key",
+            "application/pkcs8"
         )
         
         // Max file size (50GB for streaming import)
@@ -68,6 +49,7 @@ class SafFileHandler(private val context: Context) {
         
         // Threshold for streaming (10MB) - files larger use streaming
         const val STREAMING_THRESHOLD = 10L * 1024 * 1024
+        private const val TEXT_PREVIEW_LIMIT = 1024L * 1024
         
         // SECURITY: Secure random for zeroizing
         private val secureRandom = SecureRandom()
@@ -83,11 +65,17 @@ class SafFileHandler(private val context: Context) {
         }
     }
     
-    /**
-     * Check if MIME type is supported
-     */
-    fun isMimeTypeSupported(mimeType: String?): Boolean {
-        return mimeType != null && SUPPORTED_MIME_TYPES.contains(mimeType.lowercase())
+    private fun hasDedicatedPreview(mimeType: String): Boolean {
+        return mimeType.startsWith("text/") ||
+            mimeType.startsWith("image/") ||
+            mimeType.startsWith("video/") ||
+            mimeType.startsWith("audio/") ||
+            DEDICATED_PREVIEW_MIME_TYPES.contains(mimeType)
+    }
+
+    private fun usesBoundedTextPreview(mimeType: String): Boolean {
+        return mimeType.startsWith("text/") ||
+            mimeType in BOUNDED_TEXT_MIME_TYPES
     }
     
     /**
@@ -203,8 +191,11 @@ class SafFileHandler(private val context: Context) {
      * Check if file should use streaming (large file)
      * SECURITY: Use streaming for any file > 10MB to prevent OOM
      */
-    fun shouldUseStreaming(uri: Uri, fileType: Int): Boolean {
-        return getFileSize(uri) > STREAMING_THRESHOLD
+    fun shouldUseStreaming(uri: Uri, mimeType: String): Boolean {
+        val size = getFileSize(uri)
+        return size > STREAMING_THRESHOLD ||
+            !hasDedicatedPreview(mimeType) ||
+            (usesBoundedTextPreview(mimeType) && size > TEXT_PREVIEW_LIMIT)
     }
     
     /**
@@ -257,10 +248,11 @@ class SafFileHandler(private val context: Context) {
      */
     fun validateFile(uri: Uri): FileValidationResult {
         val name = getFileName(uri)
-        var mimeType = getMimeType(uri) ?: resolveMimeFromName(name)
-        if (mimeType == null) {
-            mimeType = "application/octet-stream"
-        }
+        val reportedMime = getMimeType(uri)?.lowercase()
+        val mimeType = if (reportedMime.isNullOrBlank() ||
+            reportedMime == "application/octet-stream") {
+            resolveMimeFromName(name) ?: "application/octet-stream"
+        } else reportedMime
 
         val size = getFileSize(uri)
         if (size < 0L) {
@@ -274,10 +266,6 @@ class SafFileHandler(private val context: Context) {
             return FileValidationResult.Empty
         }
         
-        if (!isMimeTypeSupported(mimeType)) {
-            return FileValidationResult.UnsupportedType(mimeType)
-        }
-
         return FileValidationResult.Valid(
             name = name,
             mimeType = mimeType,
@@ -290,7 +278,8 @@ class SafFileHandler(private val context: Context) {
         val dot = name.lastIndexOf('.')
         if (dot <= 0 || dot == name.length - 1) return null
         val ext = name.substring(dot + 1).lowercase()
-        return EXTENSION_MIME_MAP[ext]
+        return SPECIAL_EXTENSION_MIME_TYPES[ext]
+            ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
     }
     
     sealed class FileValidationResult {
@@ -301,7 +290,6 @@ class SafFileHandler(private val context: Context) {
             val fileType: Int
         ) : FileValidationResult()
         
-        data class UnsupportedType(val mimeType: String?) : FileValidationResult()
         data class TooLarge(val size: Long) : FileValidationResult()
         object UnknownSize : FileValidationResult()
         object Empty : FileValidationResult()

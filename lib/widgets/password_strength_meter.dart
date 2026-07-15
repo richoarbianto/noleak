@@ -1,15 +1,15 @@
 /// PasswordStrengthMeter - Visual Password Strength Indicator
-/// 
+///
 /// Analyzes password strength and displays a visual indicator with:
 /// - Animated progress bar with gradient colors
 /// - Strength label (Weak/Fair/Good/Strong/Perfect)
 /// - Estimated crack time based on entropy calculation
-/// 
+///
 /// The strength calculation considers:
 /// - Password length (minimum 12 characters recommended)
 /// - Character variety (lowercase, uppercase, numbers, symbols)
 /// - Common patterns and dictionary words (reduces score)
-/// 
+///
 /// Crack time estimation uses realistic entropy calculation assuming
 /// 10^10 attempts per second (modern GPU attack rate).
 
@@ -226,7 +226,8 @@ class PasswordStrengthMeter extends StatelessWidget {
     if (password.contains(RegExp(r'[a-z]'))) poolSize += 26;
     if (password.contains(RegExp(r'[A-Z]'))) poolSize += 26;
     if (password.contains(RegExp(r'[0-9]'))) poolSize += 10;
-    if (password.contains(RegExp(r"[!@#\$%^&*(),.?:{}|<>\[\]\\;'`~_+=\-/@ ]"))) {
+    if (password
+        .contains(RegExp(r"[!@#\$%^&*(),.?:{}|<>\[\]\\;'`~_+=\-/@ ]"))) {
       poolSize += 32;
     }
     if (poolSize == 0) poolSize = 26;
@@ -238,7 +239,13 @@ class PasswordStrengthMeter extends StatelessWidget {
 
     // Common words
     const commonWords = [
-      'admin', 'user', 'password', 'qwerty', 'abc', 'test', 'guest'
+      'admin',
+      'user',
+      'password',
+      'qwerty',
+      'abc',
+      'test',
+      'guest'
     ];
     for (final word in commonWords) {
       if (lower.contains(word)) entropy -= 15;
@@ -357,7 +364,8 @@ class _CrackTimeInfo {
       );
     } else if (seconds < billion) {
       return _CrackTimeInfo._(
-        message: 'Excellent: This password would take millions of years to crack',
+        message:
+            'Excellent: This password would take millions of years to crack',
         color: CyberpunkTheme.strengthPerfect,
       );
     } else {
@@ -381,7 +389,7 @@ class _BruteforceWarning extends StatelessWidget {
       crackTime.message,
       style: TextStyle(
         color: crackTime.color,
-        fontSize: 11,
+        fontSize: 12,
         fontStyle: FontStyle.italic,
       ),
     );

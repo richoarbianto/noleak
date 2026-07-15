@@ -36,6 +36,7 @@ import '../widgets/password_strength_meter.dart';
 import '../utils/secure_logger.dart';
 import '../utils/secure_passphrase.dart';
 import '../widgets/secure_keyboard.dart';
+import '../widgets/responsive_layout.dart';
 
 /// Main file browser screen for an unlocked vault.
 ///
@@ -703,6 +704,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
               CyberTextField(
                 controller: passwordController,
                 obscureText: obscure,
+                secureInput: true,
                 labelText: 'Password',
                 suffixIcon: IconButton(
                   icon: Icon(
@@ -731,6 +733,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
     );
 
     if (confirmed != true) {
+      SecurePassphrase.clearController(passwordController);
       // CRITICAL: Clear SecureKeyboard target FIRST before disposing
       if (SecureKeyboard.target.value?.controller == passwordController) {
         SecureKeyboard.target.value = null;
@@ -743,7 +746,20 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
       return;
     }
 
-    final password = passwordController.text;
+    if (!SecurePassphrase.controllerWithinLimit(passwordController)) {
+      SecurePassphrase.clearController(passwordController);
+      if (SecureKeyboard.target.value?.controller == passwordController) {
+        SecureKeyboard.target.value = null;
+        SecureKeyboard.visible.value = false;
+        SecureKeyboard.inset.value = 0;
+      }
+      Future.delayed(const Duration(milliseconds: 800), () {
+        SecurePassphrase.disposeController(passwordController);
+      });
+      return;
+    }
+    final password = SecurePassphrase.fromController(passwordController);
+    SecurePassphrase.clearController(passwordController);
     // CRITICAL: Clear SecureKeyboard target FIRST before disposing
     if (SecureKeyboard.target.value?.controller == passwordController) {
       SecureKeyboard.target.value = null;
@@ -755,6 +771,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
     });
 
     if (password.isEmpty) {
+      SecurePassphrase.zeroize(password);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -767,6 +784,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
 
     try {
       final verified = await VaultChannel.verifyPassword(password);
+      SecurePassphrase.zeroize(password);
       if (!verified) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -798,6 +816,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
         ));
       }
     } catch (e) {
+      SecurePassphrase.zeroize(password);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text('Export failed: $e'),
@@ -819,7 +838,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
   }
 
   Future<void> _showChangePasswordDialog() async {
-    final result = await showDialog<Map<String, String>>(
+    final result = await showDialog<Map<String, Uint8List>>(
       context: context,
       barrierDismissible: false,
       builder: (context) => const _ChangePasswordDialog(),
@@ -827,9 +846,9 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
 
     if (result == null) return;
 
-    final currentPassword = result['current'] ?? '';
-    final newPassword = result['new'] ?? '';
-    final confirmPassword = result['confirm'] ?? '';
+    final currentPassword = result['current'] ?? Uint8List(0);
+    final newPassword = result['new'] ?? Uint8List(0);
+    final confirmPassword = result['confirm'] ?? Uint8List(0);
 
     if (currentPassword.isEmpty) {
       if (mounted) {
@@ -839,6 +858,9 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
               backgroundColor: CyberpunkTheme.error),
         );
       }
+      SecurePassphrase.zeroize(currentPassword);
+      SecurePassphrase.zeroize(newPassword);
+      SecurePassphrase.zeroize(confirmPassword);
       return;
     }
 
@@ -850,10 +872,13 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
               backgroundColor: CyberpunkTheme.error),
         );
       }
+      SecurePassphrase.zeroize(currentPassword);
+      SecurePassphrase.zeroize(newPassword);
+      SecurePassphrase.zeroize(confirmPassword);
       return;
     }
 
-    if (newPassword != confirmPassword) {
+    if (!listEquals(newPassword, confirmPassword)) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -861,6 +886,9 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
               backgroundColor: CyberpunkTheme.error),
         );
       }
+      SecurePassphrase.zeroize(currentPassword);
+      SecurePassphrase.zeroize(newPassword);
+      SecurePassphrase.zeroize(confirmPassword);
       return;
     }
 
@@ -887,6 +915,9 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
         ));
       }
     } finally {
+      SecurePassphrase.zeroize(currentPassword);
+      SecurePassphrase.zeroize(newPassword);
+      SecurePassphrase.zeroize(confirmPassword);
       if (mounted) setState(() => _isVaultOp = false);
     }
   }
@@ -1491,6 +1522,8 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
                 Text(
                   (widget.stateManager.currentVaultTitle ?? 'VAULT')
                       .toUpperCase(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     letterSpacing: 2,
                     fontWeight: FontWeight.w600,
@@ -1499,6 +1532,8 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
                 if (_currentFolderPath.isNotEmpty)
                   Text(
                     _currentPathLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                       color: CyberpunkTheme.textHint,
                       fontSize: 12,
@@ -1508,6 +1543,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
             ),
             backgroundColor: Colors.transparent,
             elevation: 0,
+            centerTitle: false,
             actions: [
               // Lock button with glow
               Container(
@@ -1742,9 +1778,10 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
   }
 
   Widget _buildEmptyState() {
-    return Center(
+    return ResponsiveScrollView(
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 96),
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
         children: [
           Container(
             padding: const EdgeInsets.all(24),
@@ -2195,6 +2232,7 @@ class _ChangePasswordDialogState extends State<_ChangePasswordDialog> {
                 controller: _currentPasswordController,
                 labelText: 'Current Password',
                 obscureText: _obscureCurrent,
+                secureInput: true,
                 suffixIcon: IconButton(
                   icon: Icon(
                     _obscureCurrent ? Icons.visibility : Icons.visibility_off,
@@ -2211,6 +2249,7 @@ class _ChangePasswordDialogState extends State<_ChangePasswordDialog> {
                 controller: _newPasswordController,
                 labelText: 'New Password (min 12 chars)',
                 obscureText: _obscureNew,
+                secureInput: true,
                 onChanged: (_) => setState(() {}),
                 suffixIcon: IconButton(
                   icon: Icon(
@@ -2222,10 +2261,11 @@ class _ChangePasswordDialogState extends State<_ChangePasswordDialog> {
               ),
 
               // Password strength meter
-              PasswordStrengthMeter(
-                password: _newPasswordController.text,
-                minLength: 12,
-              ),
+              if (!AppSettings.instance.secureKeyboardEnabled)
+                PasswordStrengthMeter(
+                  password: _newPasswordController.text,
+                  minLength: 12,
+                ),
               const SizedBox(height: 16),
 
               // Confirm password
@@ -2233,6 +2273,7 @@ class _ChangePasswordDialogState extends State<_ChangePasswordDialog> {
                 controller: _confirmPasswordController,
                 labelText: 'Confirm New Password',
                 obscureText: _obscureConfirm,
+                secureInput: true,
                 suffixIcon: IconButton(
                   icon: Icon(
                     _obscureConfirm ? Icons.visibility : Icons.visibility_off,
@@ -2263,10 +2304,34 @@ class _ChangePasswordDialogState extends State<_ChangePasswordDialog> {
                       text: 'CHANGE',
                       icon: Icons.key,
                       onPressed: () {
-                        Navigator.pop(context, {
-                          'current': _currentPasswordController.text,
-                          'new': _newPasswordController.text,
-                          'confirm': _confirmPasswordController.text,
+                        if (!SecurePassphrase.controllerWithinLimit(
+                                _currentPasswordController) ||
+                            !SecurePassphrase.controllerWithinLimit(
+                                _newPasswordController) ||
+                            !SecurePassphrase.controllerWithinLimit(
+                                _confirmPasswordController)) return;
+                        final current = SecurePassphrase.fromController(
+                          _currentPasswordController,
+                        );
+                        final password = SecurePassphrase.fromController(
+                          _newPasswordController,
+                        );
+                        final confirm = SecurePassphrase.fromController(
+                          _confirmPasswordController,
+                        );
+                        SecurePassphrase.clearController(
+                          _currentPasswordController,
+                        );
+                        SecurePassphrase.clearController(
+                          _newPasswordController,
+                        );
+                        SecurePassphrase.clearController(
+                          _confirmPasswordController,
+                        );
+                        Navigator.pop<Map<String, Uint8List>>(context, {
+                          'current': current,
+                          'new': password,
+                          'confirm': confirm,
                         });
                       },
                     ),

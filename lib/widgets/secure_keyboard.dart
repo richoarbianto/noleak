@@ -15,6 +15,8 @@
 /// [CyberTextField] automatically when enabled in settings.
 
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import '../theme/cyberpunk_theme.dart';
 
@@ -25,9 +27,12 @@ import '../theme/cyberpunk_theme.dart';
 /// state management.
 class SecureKeyboard {
   static const double _fallbackInset = 300;
+  static const int _maxInputBytes = 1024;
   static final ValueNotifier<_KeyboardTarget?> _target = ValueNotifier(null);
   static final ValueNotifier<bool> _visible = ValueNotifier(false);
   static final ValueNotifier<double> _inset = ValueNotifier(0);
+  static final Expando<_SecureInputBuffer> _inputs =
+      Expando<_SecureInputBuffer>('secure keyboard input');
 
   static ValueNotifier<_KeyboardTarget?> get target => _target;
   static ValueNotifier<bool> get visible => _visible;
@@ -36,11 +41,17 @@ class SecureKeyboard {
   static void show(
     BuildContext context, {
     required TextEditingController controller,
+    bool secureInput = false,
+    bool obscureText = true,
     ValueChanged<String>? onChanged,
     ValueChanged<String>? onSubmitted,
   }) {
+    if (secureInput) {
+      _prepareInput(controller, obscureText);
+    }
     _target.value = _KeyboardTarget(
       controller: controller,
+      secureInput: secureInput,
       onChanged: onChanged,
       onSubmitted: onSubmitted,
     );
@@ -56,6 +67,59 @@ class SecureKeyboard {
       _inset.value = 0;
       _target.value = null;
     });
+  }
+
+  static Uint8List? copyInput(TextEditingController controller) {
+    final input = _inputs[controller];
+    if (input == null) return null;
+    return Uint8List(input.length)..setRange(0, input.length, input.bytes);
+  }
+
+  static int? inputLength(TextEditingController controller) =>
+      _inputs[controller]?.length;
+
+  static void setObscured(TextEditingController controller, bool obscureText) {
+    final input = _inputs[controller];
+    if (input == null) return;
+    input.obscured = obscureText;
+    _renderSecureInput(controller, input);
+  }
+
+  static void clearInput(TextEditingController controller) {
+    final input = _inputs[controller];
+    if (input == null) return;
+    input.bytes.fillRange(0, input.bytes.length, 0);
+    input.length = 0;
+    _inputs[controller] = null;
+  }
+
+  static void _prepareInput(
+      TextEditingController controller, bool obscureText) {
+    final prepared = _inputs[controller];
+    if (prepared != null) {
+      prepared.obscured = obscureText;
+      _renderSecureInput(controller, prepared);
+      return;
+    }
+    final input = _SecureInputBuffer();
+    final existing = utf8.encode(controller.text);
+    input.length = existing.length.clamp(0, _maxInputBytes);
+    input.bytes.setRange(0, input.length, existing);
+    input.obscured = obscureText;
+    existing.fillRange(0, existing.length, 0);
+    _inputs[controller] = input;
+    _renderSecureInput(controller, input);
+  }
+
+  static void _renderSecureInput(
+      TextEditingController controller, _SecureInputBuffer input) {
+    final value = input.obscured
+        ? List.filled(input.characterCount, '\u2022').join()
+        : utf8.decode(Uint8List.sublistView(input.bytes, 0, input.length));
+    controller.value = TextEditingValue(
+      text: value,
+      selection: TextSelection.collapsed(offset: value.length),
+    );
   }
 
   /// Check if the current target controller is still valid (mounted)
@@ -174,26 +238,65 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
   void _emitChanged() {
     final controller = _controller;
     if (controller == null) return;
-    _activeTarget?.onChanged?.call(controller.text);
+    final target = _activeTarget;
+    if (target == null) return;
+    final input = SecureKeyboard._inputs[controller];
+    final value = target.secureInput && input != null
+        ? List.filled(input.characterCount, '\u2022').join()
+        : controller.text;
+    target.onChanged?.call(value);
   }
 
   void _insertText(String value) {
     final controller = _controller;
     if (controller == null) return;
-    final updated = controller.text + value;
-    controller.text = updated;
-    controller.selection = TextSelection.collapsed(offset: updated.length);
+    final target = _activeTarget;
+    if (target == null) return;
+    if (!target.secureInput) {
+      final updated = controller.text + value;
+      controller.value = TextEditingValue(
+        text: updated,
+        selection: TextSelection.collapsed(offset: updated.length),
+      );
+      _emitChanged();
+      return;
+    }
+    final input = SecureKeyboard._inputs[controller];
+    if (input == null) return;
+    final encoded = utf8.encode(value);
+    if (input.length + encoded.length > SecureKeyboard._maxInputBytes) return;
+    input.bytes.setRange(input.length, input.length + encoded.length, encoded);
+    input.length += encoded.length;
+    SecureKeyboard._renderSecureInput(controller, input);
     _emitChanged();
   }
 
   void _backspace() {
     final controller = _controller;
     if (controller == null) return;
-    final current = controller.text;
-    if (current.isEmpty) return;
-    final updated = current.substring(0, current.length - 1);
-    controller.text = updated;
-    controller.selection = TextSelection.collapsed(offset: updated.length);
+    final target = _activeTarget;
+    if (target == null) return;
+    if (!target.secureInput) {
+      final current = controller.text;
+      if (current.isEmpty) return;
+      final lastRuneLength = current.runes.last > 0xffff ? 2 : 1;
+      final updated = current.substring(0, current.length - lastRuneLength);
+      controller.value = TextEditingValue(
+        text: updated,
+        selection: TextSelection.collapsed(offset: updated.length),
+      );
+      _emitChanged();
+      return;
+    }
+    final input = SecureKeyboard._inputs[controller];
+    if (input == null || input.length == 0) return;
+    final oldLength = input.length;
+    input.length--;
+    while (input.length > 0 && (input.bytes[input.length] & 0xc0) == 0x80) {
+      input.length--;
+    }
+    input.bytes.fillRange(input.length, oldLength, 0);
+    SecureKeyboard._renderSecureInput(controller, input);
     _emitChanged();
   }
 
@@ -244,7 +347,12 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
     if (key == _enterKey) {
       final controller = _controller;
       if (controller != null) {
-        _activeTarget?.onSubmitted?.call(controller.text);
+        final target = _activeTarget;
+        final input = SecureKeyboard._inputs[controller];
+        final value = target?.secureInput == true && input != null
+            ? List.filled(input.characterCount, '\u2022').join()
+            : controller.text;
+        target?.onSubmitted?.call(value);
       }
       SecureKeyboard.hide();
       return;
@@ -310,7 +418,7 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
     return 1;
   }
 
- Widget _buildKey(String key) {
+  Widget _buildKey(String key) {
     final isAction = key.startsWith('_');
     final flex = _keyFlex(key);
     final isShiftKey = key == _shiftKey;
@@ -324,8 +432,7 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
       return Expanded(
         flex: flex,
         child: Padding(
-          padding:
-              const EdgeInsets.symmetric(horizontal: _keyGap, vertical: 3),
+          padding: const EdgeInsets.symmetric(horizontal: _keyGap, vertical: 3),
           child: Material(
             color: bgColor,
             borderRadius: BorderRadius.circular(_keyRadius),
@@ -419,7 +526,7 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
                 style: TextStyle(
                   color: CyberpunkTheme.textSecondary,
                   fontWeight: FontWeight.w500,
-                  fontSize: 11,
+                  fontSize: 12,
                 ),
               ),
               const Spacer(),
@@ -441,13 +548,29 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
   }
 }
 
+class _SecureInputBuffer {
+  final Uint8List bytes = Uint8List(SecureKeyboard._maxInputBytes);
+  int length = 0;
+  bool obscured = true;
+
+  int get characterCount {
+    var count = 0;
+    for (var i = 0; i < length; i++) {
+      if ((bytes[i] & 0xc0) != 0x80) count++;
+    }
+    return count;
+  }
+}
+
 class _KeyboardTarget {
   final TextEditingController controller;
+  final bool secureInput;
   final ValueChanged<String>? onChanged;
   final ValueChanged<String>? onSubmitted;
 
   const _KeyboardTarget({
     required this.controller,
+    required this.secureInput,
     this.onChanged,
     this.onSubmitted,
   });

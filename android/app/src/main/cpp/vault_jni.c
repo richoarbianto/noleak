@@ -99,11 +99,64 @@ Java_com_noleak_noleak_vault_VaultEngine_nativeInit(JNIEnv* env, jclass clazz) {
 
 JNIEXPORT void JNICALL
 Java_com_noleak_noleak_vault_VaultEngine_nativeSetKdfProfile(
-    JNIEnv* env, jclass clazz, jlong totalRamMb
+    JNIEnv* env, jclass clazz, jlong totalRamMb, jlong availableRamMb,
+    jboolean isLowRamDevice, jboolean is64BitProcess
 ) {
     UNUSED(env);
     UNUSED(clazz);
-    vault_set_kdf_profile_by_ram((size_t)totalRamMb);
+    vault_set_kdf_profile_by_ram((size_t)totalRamMb, (size_t)availableRamMb,
+                                 isLowRamDevice == JNI_TRUE,
+                                 is64BitProcess == JNI_TRUE);
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_com_noleak_noleak_vault_VaultEngine_nativeGetKdfInfo(JNIEnv* env,
+                                                           jclass clazz) {
+    UNUSED(clazz);
+    size_t memory;
+    uint32_t iterations;
+    uint32_t parallel;
+    if (g_vault.is_open) {
+        memory = g_vault.kdf_mem;
+        iterations = g_vault.kdf_iter;
+        parallel = g_vault.kdf_parallel;
+    } else {
+        vault_get_kdf_params(&memory, &iterations, &parallel);
+    }
+    jlong values[4] = {(jlong)memory, (jlong)iterations, (jlong)parallel,
+                       g_vault.is_open ? 1 : 0};
+    jlongArray result = (*env)->NewLongArray(env, 4);
+    if (result) (*env)->SetLongArrayRegion(env, result, 0, 4, values);
+    return result;
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_com_noleak_noleak_vault_VaultEngine_nativeInspectKdfInfo(
+    JNIEnv* env, jclass clazz, jstring path) {
+    UNUSED(clazz);
+    char* c_path = jstring_to_cstring(env, path);
+    if (!c_path) return NULL;
+
+    uint32_t memory;
+    uint32_t iterations;
+    uint32_t parallelism;
+    int status = vault_inspect_kdf_params(c_path, &memory, &iterations,
+                                          &parallelism);
+    free(c_path);
+    if (status != VAULT_OK) return NULL;
+
+    size_t device_memory;
+    uint32_t device_iterations;
+    uint32_t device_parallelism;
+    vault_get_kdf_params(&device_memory, &device_iterations,
+                         &device_parallelism);
+
+    jlong values[6] = {(jlong)memory, (jlong)iterations, (jlong)parallelism,
+                       (jlong)device_memory, (jlong)device_iterations,
+                       (jlong)device_parallelism};
+    jlongArray result = (*env)->NewLongArray(env, 6);
+    if (result) (*env)->SetLongArrayRegion(env, result, 0, 6, values);
+    return result;
 }
 
 JNIEXPORT jint JNICALL
@@ -161,6 +214,21 @@ Java_com_noleak_noleak_vault_VaultEngine_nativeOpen(
     free(pass);
     free(c_path);
     
+    return result;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_noleak_noleak_vault_VaultEngine_nativeVerifyPassword(
+    JNIEnv* env, jclass clazz, jbyteArray passphrase
+) {
+    UNUSED(clazz);
+    size_t pass_len;
+    uint8_t* pass = jbytearray_to_uint8(env, passphrase, &pass_len);
+    if (!pass) return VAULT_ERR_INVALID_PARAM;
+    jbytearray_zeroize(env, passphrase);
+    int result = vault_verify_password(pass, pass_len);
+    vault_zeroize(pass, pass_len);
+    free(pass);
     return result;
 }
 
@@ -477,9 +545,12 @@ Java_com_noleak_noleak_vault_VaultEngine_nativeSecureWipeFile(
 // Register native methods
 static JNINativeMethod gMethods[] = {
     {"nativeInit", "()I", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeInit},
-    {"nativeSetKdfProfile", "(J)V", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeSetKdfProfile},
+    {"nativeSetKdfProfile", "(JJZZ)V", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeSetKdfProfile},
+    {"nativeGetKdfInfo", "()[J", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeGetKdfInfo},
+    {"nativeInspectKdfInfo", "(Ljava/lang/String;)[J", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeInspectKdfInfo},
     {"nativeCreate", "(Ljava/lang/String;[B)I", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeCreate},
     {"nativeOpen", "(Ljava/lang/String;[B)I", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeOpen},
+    {"nativeVerifyPassword", "([B)I", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeVerifyPassword},
     {"nativeClose", "()V", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeClose},
     {"nativeIsOpen", "()Z", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeIsOpen},
     {"nativeImportFile", "([BILjava/lang/String;Ljava/lang/String;)[B", (void*)Java_com_noleak_noleak_vault_VaultEngine_nativeImportFile},

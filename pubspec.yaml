@@ -1,7 +1,7 @@
 name: noleak
 description: "A new Flutter project."
 publish_to: 'none'
-version: 1.0.1+1001
+version: 1.0.2+1002
 
 environment:
   sdk: ^3.5.2

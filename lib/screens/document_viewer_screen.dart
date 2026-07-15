@@ -61,7 +61,22 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
 
   @override
   void dispose() {
+    _clearPdfPage();
+    _textContent = null;
+    _error = null;
     super.dispose();
+  }
+
+  void _zeroizePdfPage(Uint8List? page) {
+    if (page == null) return;
+    PaintingBinding.instance.imageCache.evict(MemoryImage(page));
+    SecurePassphrase.zeroize(page);
+  }
+
+  void _clearPdfPage() {
+    final page = _pdfPagePng;
+    _pdfPagePng = null;
+    _zeroizePdfPage(page);
   }
 
   Future<void> _checkSecurityAndLoad() async {
@@ -96,18 +111,21 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
         return;
       }
       data = await VaultChannel.readFile(widget.entry.fileId);
+      if (!mounted) return;
       final text = _extractText(data);
-      _textContent = text;
-      SecurePassphrase.zeroize(data);
-    } catch (e) {
-      SecurePassphrase.zeroize(data);
-      _error = e.toString();
-    }
-
-    if (mounted) {
       setState(() {
+        _textContent = text;
         _isLoading = false;
       });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = 'Document preview failed.';
+          _isLoading = false;
+        });
+      }
+    } finally {
+      SecurePassphrase.zeroize(data);
     }
   }
 
@@ -119,24 +137,35 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
       });
     }
 
+    Uint8List? pendingPage;
     try {
       final page = await VaultChannel.renderPdfPage(
         widget.entry.fileId,
         pageIndex: pageIndex,
       );
+      final png = page['png'];
+      if (png is! Uint8List) {
+        throw StateError('Invalid PDF page response');
+      }
+      pendingPage = png;
       if (!mounted) return;
+      final previousPage = _pdfPagePng;
       setState(() {
-        _pdfPagePng = page['png'] as Uint8List;
+        _pdfPagePng = pendingPage;
         _pdfPageIndex = page['pageIndex'] as int? ?? pageIndex;
         _pdfPageCount = page['pageCount'] as int? ?? 1;
         _isLoading = false;
       });
+      pendingPage = null;
+      _zeroizePdfPage(previousPage);
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = e.toString();
+        _error = 'PDF preview failed.';
         _isLoading = false;
       });
+    } finally {
+      _zeroizePdfPage(pendingPage);
     }
   }
 
@@ -392,8 +421,8 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
           ),
         ],
       ),
-      );
-    }
+    );
+  }
 
   Widget _buildPdfBody() {
     final pagePng = _pdfPagePng;

@@ -1,23 +1,10 @@
-/// VaultInfoScreen - Security Information Display
-/// 
-/// Educational screen explaining the security architecture and
-/// protection mechanisms used by NoLeak Vault. Organized into
-/// three tabs:
-/// 
-/// 1. OVERVIEW: Mission statement and core security principles
-/// 2. CRYPTOGRAPHY: Key hierarchy, algorithms, quantum resistance
-/// 3. PROTECTION: Brute-force, environment, memory, and data protection
-/// 
-/// This screen helps users understand the security guarantees
-/// provided by the application.
+// User-facing explanation of NoLeak's security model, cryptography, and
+// runtime protections. Claims here must stay aligned with the implementation.
 
 import 'package:flutter/material.dart';
+import '../services/vault_channel.dart';
 import '../theme/cyberpunk_theme.dart';
 
-/// Security information screen with tabbed content.
-/// 
-/// Displays detailed information about the cryptographic
-/// architecture and security measures implemented.
 class VaultInfoScreen extends StatefulWidget {
   const VaultInfoScreen({super.key});
 
@@ -27,6 +14,22 @@ class VaultInfoScreen extends StatefulWidget {
 
 class _VaultInfoScreenState extends State<VaultInfoScreen> {
   int _selectedTab = 0;
+  Map<String, dynamic>? _kdfInfo;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadKdfInfo();
+  }
+
+  Future<void> _loadKdfInfo() async {
+    try {
+      final value = await VaultChannel.getKdfInfo();
+      if (mounted) setState(() => _kdfInfo = value);
+    } catch (_) {
+      // Static KDF description remains available if native info is unavailable.
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -34,7 +37,7 @@ class _VaultInfoScreenState extends State<VaultInfoScreen> {
       backgroundColor: CyberpunkTheme.background,
       appBar: AppBar(
         title: const Text(
-          'SECURITY INFO',
+          'SECURITY CENTER',
           style: TextStyle(
             color: CyberpunkTheme.neonGreen,
             letterSpacing: 1.5,
@@ -52,10 +55,10 @@ class _VaultInfoScreenState extends State<VaultInfoScreen> {
             Expanded(
               child: IndexedStack(
                 index: _selectedTab,
-                children: const [
-                  _OverviewTab(),
-                  _CryptoTab(),
-                  _ProtectionTab(),
+                children: [
+                  const _OverviewTab(),
+                  _CryptoTab(kdfInfo: _kdfInfo),
+                  const _ProtectionTab(),
                 ],
               ),
             ),
@@ -118,59 +121,75 @@ class _OverviewTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(20, 20, 20, 32),
+    return const SingleChildScrollView(
+      padding: EdgeInsets.fromLTRB(20, 20, 20, 32),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const _SloganHeader(),
-          const SizedBox(height: 24),
+          _SloganHeader(),
+          SizedBox(height: 24),
           _SectionCard(
-            title: 'Why We Built This',
-            child: const Text(
-              'No Leak Vaults is designed for those who refuse to let sensitive data '
-              'leave their device. Every file stays local, encrypted end-to-end, '
-              'and can only be unlocked with your passphrase.\n\n'
-              'No cloud. No third parties. Just you and your data.',
+            title: 'Protection Model',
+            subtitle: 'What NoLeak is designed to protect',
+            child: Text(
+              'NoLeak protects files at rest inside an encrypted vault. Vault data '
+              'stays on your device unless you explicitly export a file or encrypted '
+              'container. The Android app has no Internet permission, cloud account, '
+              'or remote recovery service.',
               style: _Styles.body,
             ),
           ),
-          const SizedBox(height: 16),
+          SizedBox(height: 16),
           _SectionCard(
-            title: 'Core Security Principles',
+            title: 'Security Advantages',
             child: Column(
-              children: const [
+              children: [
                 _PrincipleItem(
-                  icon: Icons.smartphone,
-                  title: 'Local-First',
-                  desc: 'No servers, no cloud sync, no external dependencies.',
+                  icon: Icons.cloud_off,
+                  title: 'Smaller Exposure Surface',
+                  desc:
+                      'No backend or cloud sync means vault contents are not sent to a remote service.',
                 ),
                 _PrincipleItem(
-                  icon: Icons.visibility_off,
-                  title: 'Zero-Knowledge',
-                  desc: 'Keys derived solely from your passphrase, never stored.',
+                  icon: Icons.verified_user,
+                  title: 'Authenticated Encryption',
+                  desc:
+                      'Encrypted content is authenticated, so modified data is rejected before it is trusted.',
                 ),
                 _PrincipleItem(
-                  icon: Icons.shield,
-                  title: 'Fail-Closed',
-                  desc: 'Access denied when root, debug, or tampering detected.',
+                  icon: Icons.key,
+                  title: 'Separated File Keys',
+                  desc:
+                      'Each file has its own random data key, wrapped by the vault master key.',
                 ),
                 _PrincipleItem(
-                  icon: Icons.data_object,
-                  title: 'Minimal Metadata',
-                  desc: 'Only essential vault information is retained.',
+                  icon: Icons.layers,
+                  title: 'Defense in Depth',
+                  desc:
+                      'Passphrase, strong biometric authentication, rate limiting, auto-lock, and device checks work together.',
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 16),
+          SizedBox(height: 16),
           _SectionCard(
-            title: 'Our Mission',
-            child: const Text(
-              'To give you absolute control over your data. No third parties. '
-              'No cloud dependencies. No compromises on privacy.\n\n'
-              'Your secrets stay yours.',
-              style: _Styles.body,
+            title: 'Your Security Still Matters',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Use a long, unique passphrase and keep your Android device updated. '
+                  'NoLeak cannot recover a forgotten passphrase because it does not '
+                  'store a recovery key.',
+                  style: _Styles.body,
+                ),
+                SizedBox(height: 12),
+                _InfoBox(
+                  icon: Icons.info_outline,
+                  text:
+                      'No application can guarantee secrecy on a fully compromised device. Environment checks reduce risk but are not a substitute for a trusted operating system.',
+                ),
+              ],
             ),
           ),
         ],
@@ -183,7 +202,9 @@ class _OverviewTab extends StatelessWidget {
 // CRYPTOGRAPHY TAB
 // ============================================================================
 class _CryptoTab extends StatelessWidget {
-  const _CryptoTab();
+  final Map<String, dynamic>? kdfInfo;
+
+  const _CryptoTab({required this.kdfInfo});
 
   @override
   Widget build(BuildContext context) {
@@ -193,64 +214,71 @@ class _CryptoTab extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _SectionCard(
-            title: 'Key Hierarchy',
-            subtitle: 'Multi-layer encryption architecture',
-            child: const _KeyHierarchyDiagram(),
+            title: 'Argon2id Profile',
+            subtitle: 'Memory-hard passphrase protection',
+            child: _KdfProfilePanel(info: kdfInfo),
           ),
           const SizedBox(height: 16),
-          _SectionCard(
-            title: 'Algorithms Used',
+          const _SectionCard(
+            title: 'Key Architecture',
+            subtitle: 'Passphrase-derived access with per-file key separation',
+            child: _KeyHierarchyDiagram(),
+          ),
+          const SizedBox(height: 16),
+          const _SectionCard(
+            title: 'Cryptographic Components',
             child: Column(
-              children: const [
-                _AlgorithmItem(
-                  name: 'Argon2id',
-                  purpose: 'Key Derivation Function (KDF)',
-                  details: 'Memory-hard, GPU/ASIC resistant. Adaptive parameters based on device RAM (32-256 MB memory cost).',
-                  icon: Icons.key,
-                ),
-                SizedBox(height: 12),
+              children: [
                 _AlgorithmItem(
                   name: 'XChaCha20-Poly1305',
-                  purpose: 'Auth Encryption (AEAD)',
-                  details: '256-bit key, 192-bit nonce. Provides confidentiality + integrity. No nonce collision risk.',
+                  purpose: 'Authenticated Encryption',
+                  details:
+                      'Encrypts file data, keys, and the vault index with a 256-bit key and a 192-bit nonce. Authentication tags detect modification.',
                   icon: Icons.lock,
                 ),
                 SizedBox(height: 12),
                 _AlgorithmItem(
-                  name: 'SHA-256',
-                  purpose: 'Integrity Verification',
-                  details: 'Container-level integrity hash. Detects file corruption or tampering.',
-                  icon: Icons.verified,
+                  name: 'Argon2id',
+                  purpose: 'Passphrase Derivation',
+                  details:
+                      'Turns the passphrase and a random salt into a key-encryption key. Memory cost makes large-scale guessing more expensive.',
+                  icon: Icons.password,
                 ),
                 SizedBox(height: 12),
                 _AlgorithmItem(
                   name: 'libsodium CSPRNG',
-                  purpose: 'Random Number Generation',
-                  details: 'Cryptographically secure random for salts, nonces, and key generation.',
+                  purpose: 'Secure Randomness',
+                  details:
+                      'Generates independent salts, nonces, master keys, and per-file data keys.',
                   icon: Icons.casino,
+                ),
+                SizedBox(height: 12),
+                _AlgorithmItem(
+                  name: 'SHA-256',
+                  purpose: 'Corruption Check',
+                  details:
+                      'Checks container consistency. Cryptographic tamper detection is provided by the authenticated-encryption tags.',
+                  icon: Icons.fact_check,
                 ),
               ],
             ),
           ),
           const SizedBox(height: 16),
-          _SectionCard(
-            title: 'Quantum Resistance',
+          const _SectionCard(
+            title: 'Profile Compatibility',
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: const [
+              children: [
                 Text(
-                  '256-bit symmetric encryption remains highly resistant to quantum attacks.',
+                  'New vaults select a 64, 128, or 256 MB memory profile based on '
+                  'device capacity. The selected values are stored in the vault header.',
                   style: _Styles.body,
                 ),
                 SizedBox(height: 12),
                 _InfoBox(
-                  icon: Icons.science,
-                  text: "Even with Grover's algorithm, effective complexity stays at 2¹²⁸—far beyond practical reach.",
-                ),
-                SizedBox(height: 12),
-                Text(
-                  'By avoiding RSA/ECC for data protection, this architecture is built to withstand the post-quantum era.',
-                  style: _Styles.body,
+                  icon: Icons.memory,
+                  text:
+                      'Existing vaults always use their stored Argon2id values. NoLeak validates imported headers and warns when a vault exceeds this device profile. It never silently lowers the values, because that would derive a different key.',
                 ),
               ],
             ),
@@ -269,109 +297,234 @@ class _ProtectionTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(20, 20, 20, 32),
+    return const SingleChildScrollView(
+      padding: EdgeInsets.fromLTRB(20, 20, 20, 32),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _SectionCard(
-            title: 'Brute-Force Protection',
+            title: 'Access & Authentication',
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: const [
-                Text(
-                  'Multi-layer defense against password guessing attacks:',
-                  style: _Styles.body,
-                ),
-                SizedBox(height: 12),
+              children: [
                 _ProtectionItem(
-                  title: 'Argon2id KDF',
-                  desc: 'Memory-hard function makes each attempt expensive (32-256 MB RAM required per attempt).',
+                  title: 'Passphrase + Strong Biometric',
+                  desc:
+                      'Vault unlock requires the correct passphrase followed by a Keystore-backed strong biometric check.',
                 ),
                 _ProtectionItem(
-                  title: 'Progressive Lockout',
-                  desc: '5 fails → 30s, 8 fails → 2min, 10 fails → 5min, 15 fails → 15min, 20 fails → 1 hour.',
+                  title: 'Persistent Attempt Limits',
+                  desc:
+                      'Short delays begin after failures. After 5 failures, lockout starts at 1 minute and increases up to 30 minutes.',
                 ),
                 _ProtectionItem(
-                  title: 'Persistent Tracking',
-                  desc: 'Attempt count survives app restart. Cannot bypass by force-closing.',
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-          _SectionCard(
-            title: 'Environment Security',
-            child: Column(
-              children: const [
-                _ProtectionItem(
-                  title: 'Root Detection',
-                  desc: 'Detects su binaries, Magisk, and common root indicators.',
+                  title: 'Per-Vault Coverage',
+                  desc:
+                      'The app applies the same persistent limiter to unlock, verification, title changes, password changes, and deletion.',
                 ),
                 _ProtectionItem(
-                  title: 'Emulator Detection',
-                  desc: 'Blocks execution on emulators and virtual devices.',
-                ),
-                _ProtectionItem(
-                  title: 'Debugger Detection',
-                  desc: 'Detects attached debuggers and instrumentation.',
-                ),
-                _ProtectionItem(
-                  title: 'Tampering Detection',
-                  desc: 'Verifies app signature and detects repackaging.',
+                  title: 'Automatic Re-Authentication',
+                  desc:
+                      'Configurable idle locking and session biometric checks reduce exposure when the app is left unattended.',
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 16),
+          SizedBox(height: 16),
           _SectionCard(
-            title: 'Memory Security',
+            title: 'Device & Runtime Protection',
             child: Column(
-              children: const [
+              children: [
                 _ProtectionItem(
-                  title: 'Memory Locking',
-                  desc: 'Master key locked in RAM, prevented from swap to disk.',
+                  title: 'Fail-Closed Environment Gate',
+                  desc:
+                      'Vault operations are blocked when checks detect root or Magisk artifacts, emulators, debugging, hooking, ADB, an unlocked boot state, an untrusted installer, or an unexpected app signature.',
                 ),
                 _ProtectionItem(
-                  title: 'Secure Wipe',
-                  desc: 'All sensitive data overwritten with random bytes then zeroed.',
+                  title: 'Screen Capture Reduction',
+                  desc:
+                      'Android FLAG_SECURE reduces screenshots, screen recording, and recent-app previews.',
                 ),
                 _ProtectionItem(
-                  title: 'Constant-Time Comparison',
-                  desc: 'Password verification immune to timing attacks.',
+                  title: 'Overlay-Touch Blocking',
+                  desc:
+                      'Non-system overlays are hidden on supported Android versions, and obscured touch events are rejected.',
                 ),
                 _ProtectionItem(
-                  title: 'No Plaintext Logging',
-                  desc: 'Sensitive data sanitized from all log outputs.',
+                  title: 'No Network or Android Backup',
+                  desc:
+                      'The app removes Internet permission and excludes its private data from Android backup and device-transfer extraction.',
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 16),
+          SizedBox(height: 16),
           _SectionCard(
-            title: 'Data Protection',
+            title: 'Sensitive Data Handling',
             child: Column(
-              children: const [
+              children: [
                 _ProtectionItem(
-                  title: 'Screenshot Blocking',
-                  desc: 'FLAG_SECURE prevents screenshots and screen recording.',
+                  title: 'Mutable Passphrase Transport',
+                  desc:
+                      'Secure fields transport passphrases as mutable UTF-8 bytes and clear app-controlled buffers after use.',
                 ),
                 _ProtectionItem(
-                  title: 'Backup Exclusion',
-                  desc: 'Vault data excluded from Android backup systems.',
+                  title: 'Best-Effort Memory Locking',
+                  desc:
+                      'The native engine attempts to lock the master key in RAM and continues safely with standard memory when the platform refuses it.',
                 ),
                 _ProtectionItem(
-                  title: 'Secure File Deletion',
-                  desc: 'Files overwritten with random data before deletion.',
+                  title: 'Buffer Cleanup',
+                  desc:
+                      'Native keys, passphrases, decrypted chunks, and viewer buffers are zeroized when their lifecycle ends.',
                 ),
                 _ProtectionItem(
-                  title: 'Biometric Protection',
-                  desc: 'Hardware-backed keys invalidated on fingerprint changes.',
+                  title: 'Release Logging Disabled',
+                  desc:
+                      'Application and native diagnostic logging is disabled in release builds.',
+                ),
+              ],
+            ),
+          ),
+          SizedBox(height: 16),
+          _SectionCard(
+            title: 'Important Limits',
+            child: Column(
+              children: [
+                _ProtectionItem(
+                  icon: Icons.warning_amber_rounded,
+                  color: CyberpunkTheme.warning,
+                  title: 'Offline Guessing',
+                  desc:
+                      'A copied vault can be tested outside NoLeak without the app limiter. A long, unique passphrase remains essential.',
+                ),
+                _ProtectionItem(
+                  icon: Icons.warning_amber_rounded,
+                  color: CyberpunkTheme.warning,
+                  title: 'Compromised Operating System',
+                  desc:
+                      'Root and tamper checks raise the barrier but cannot guarantee protection if Android itself is fully controlled by an attacker.',
+                ),
+                _ProtectionItem(
+                  icon: Icons.warning_amber_rounded,
+                  color: CyberpunkTheme.warning,
+                  title: 'Flash Storage Deletion',
+                  desc:
+                      'Vault deletion overwrites data before removal, but physical erasure is best-effort on flash storage because of wear leveling.',
+                ),
+                _ProtectionItem(
+                  icon: Icons.visibility,
+                  color: CyberpunkTheme.warning,
+                  title: 'Showing a Passphrase',
+                  desc:
+                      'When you choose to reveal a passphrase, Flutter must briefly create a displayable string. Hiding it returns the field to masked output.',
                 ),
               ],
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// KDF PROFILE
+// ============================================================================
+class _KdfProfilePanel extends StatelessWidget {
+  final Map<String, dynamic>? info;
+
+  const _KdfProfilePanel({required this.info});
+
+  String _value(String key, {String suffix = ''}) {
+    final value = info?[key];
+    return value is num ? '${value.toInt()}$suffix' : '—';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final columns = constraints.maxWidth >= 480 ? 3 : 2;
+            final width = (constraints.maxWidth - (columns - 1) * 8) / columns;
+            return Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _KdfMetric(
+                  width: width,
+                  label: 'Memory cost',
+                  value: _value('memoryMiB', suffix: ' MB'),
+                ),
+                _KdfMetric(
+                  width: width,
+                  label: 'Operations',
+                  value: _value('opslimit'),
+                ),
+                _KdfMetric(
+                  width: columns == 2 ? constraints.maxWidth : width,
+                  label: 'Parallelism',
+                  value: _value('parallelism'),
+                ),
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Higher memory cost makes each passphrase guess more expensive. NoLeak '
+          'selects a device-appropriate profile when a vault is created, stores '
+          'those values with the vault, and uses them unchanged on every unlock.',
+          style: _Styles.bodySmall,
+        ),
+      ],
+    );
+  }
+}
+
+class _KdfMetric extends StatelessWidget {
+  final double width;
+  final String label;
+  final String value;
+
+  const _KdfMetric({
+    required this.width,
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: '$label: $value',
+      child: Container(
+        width: width,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+        decoration: BoxDecoration(
+          color: CyberpunkTheme.background,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: CyberpunkTheme.neonGreen.withOpacity(0.2),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label, style: _Styles.bodySmall),
+            const SizedBox(height: 2),
+            Text(
+              value,
+              style: const TextStyle(
+                color: CyberpunkTheme.neonGreen,
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -394,10 +547,10 @@ class _KeyHierarchyDiagram extends StatelessWidget {
           color: CyberpunkTheme.neonGreen.withOpacity(0.2),
         ),
       ),
-      child: Column(
-        children: const [
+      child: const Column(
+        children: [
           _KeyNode(
-            label: 'Your Passphrase',
+            label: 'Passphrase',
             icon: Icons.password,
             isTop: true,
           ),
@@ -406,6 +559,7 @@ class _KeyHierarchyDiagram extends StatelessWidget {
             label: 'KEK',
             sublabel: 'Key Encryption Key',
             icon: Icons.vpn_key,
+            note: 'Derived during unlock; not written to the vault',
           ),
           _KeyArrow(label: 'XChaCha20-Poly1305 wrap'),
           _KeyNode(
@@ -419,12 +573,12 @@ class _KeyHierarchyDiagram extends StatelessWidget {
             label: 'DEK',
             sublabel: 'Data Encryption Key',
             icon: Icons.enhanced_encryption,
-            note: 'Per-file, stored in encrypted index',
+            note: 'Random key per file, stored encrypted',
           ),
           _KeyArrow(label: 'XChaCha20-Poly1305 encrypt'),
           _KeyNode(
             label: 'Encrypted Data',
-            sublabel: '64KB chunks',
+            sublabel: 'Authenticated chunks',
             icon: Icons.folder_zip,
             isBottom: true,
           ),
@@ -475,7 +629,10 @@ class _KeyNode extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 2,
+                  crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
                     Text(
                       label,
@@ -485,16 +642,14 @@ class _KeyNode extends StatelessWidget {
                         fontSize: 13,
                       ),
                     ),
-                    if (sublabel != null) ...[
-                      const SizedBox(width: 6),
+                    if (sublabel != null)
                       Text(
                         '($sublabel)',
                         style: TextStyle(
                           color: color.withOpacity(0.7),
-                          fontSize: 11,
+                          fontSize: 12,
                         ),
                       ),
-                    ],
                   ],
                 ),
                 if (note != null)
@@ -502,7 +657,7 @@ class _KeyNode extends StatelessWidget {
                     note!,
                     style: TextStyle(
                       color: CyberpunkTheme.neonGreenDim.withOpacity(0.8),
-                      fontSize: 10,
+                      fontSize: 12,
                     ),
                   ),
               ],
@@ -545,7 +700,7 @@ class _KeyArrow extends StatelessWidget {
               label,
               style: TextStyle(
                 color: CyberpunkTheme.neonGreenDim.withOpacity(0.8),
-                fontSize: 10,
+                fontSize: 12,
                 fontStyle: FontStyle.italic,
               ),
             ),
@@ -567,7 +722,7 @@ class _SloganHeader extends StatelessWidget {
     return Column(
       children: [
         const Text(
-          'Take Back Control of Your Privacy',
+          'Security You Can Understand',
           style: TextStyle(
             color: CyberpunkTheme.neonGreen,
             fontSize: 18,
@@ -579,7 +734,7 @@ class _SloganHeader extends StatelessWidget {
         ),
         const SizedBox(height: 6),
         Text(
-          'Total privacy. Fully local.',
+          'Local encryption, layered access, transparent limits.',
           style: TextStyle(
             color: CyberpunkTheme.neonGreenDim.withOpacity(0.9),
             fontSize: 14,
@@ -720,7 +875,10 @@ class _AlgorithmItem extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 4,
+                  crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
                     Text(
                       name,
@@ -730,7 +888,6 @@ class _AlgorithmItem extends StatelessWidget {
                         fontSize: 13,
                       ),
                     ),
-                    const SizedBox(width: 8),
                     Container(
                       padding: const EdgeInsets.symmetric(
                         horizontal: 6,
@@ -744,7 +901,7 @@ class _AlgorithmItem extends StatelessWidget {
                         purpose,
                         style: TextStyle(
                           color: CyberpunkTheme.neonGreen.withOpacity(0.9),
-                          fontSize: 9,
+                          fontSize: 12,
                           fontWeight: FontWeight.w500,
                         ),
                       ),
@@ -765,8 +922,15 @@ class _AlgorithmItem extends StatelessWidget {
 class _ProtectionItem extends StatelessWidget {
   final String title;
   final String desc;
+  final IconData icon;
+  final Color color;
 
-  const _ProtectionItem({required this.title, required this.desc});
+  const _ProtectionItem({
+    required this.title,
+    required this.desc,
+    this.icon = Icons.check_circle,
+    this.color = CyberpunkTheme.neonGreen,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -777,9 +941,9 @@ class _ProtectionItem extends StatelessWidget {
         children: [
           Container(
             margin: const EdgeInsets.only(top: 4),
-            child: const Icon(
-              Icons.check_circle,
-              color: CyberpunkTheme.neonGreen,
+            child: Icon(
+              icon,
+              color: color,
               size: 16,
             ),
           ),
@@ -790,8 +954,8 @@ class _ProtectionItem extends StatelessWidget {
               children: [
                 Text(
                   title,
-                  style: const TextStyle(
-                    color: CyberpunkTheme.neonGreen,
+                  style: TextStyle(
+                    color: color,
                     fontWeight: FontWeight.w600,
                     fontSize: 12,
                   ),
@@ -862,7 +1026,7 @@ class _Styles {
 
   static final bodySmall = TextStyle(
     color: CyberpunkTheme.neonGreenDim.withOpacity(0.85),
-    fontSize: 11,
+    fontSize: 12,
     height: 1.4,
   );
 }

@@ -17,6 +17,7 @@ import 'services/vault_state_manager.dart';
 import 'services/vault_registry.dart';
 import 'services/vault_channel.dart';
 import 'widgets/secure_keyboard.dart';
+import 'widgets/responsive_layout.dart';
 import 'services/app_settings.dart';
 import 'screens/blocked_screen.dart';
 import 'screens/app_lock_screen.dart';
@@ -209,7 +210,11 @@ class _NoLeakAppState extends State<NoLeakApp> with WidgetsBindingObserver {
       onGenerateRoute: _onGenerateRoute,
       builder: (context, child) {
         // Wrap all routes with SecureKeyboardHost for consistent keyboard support
-        return SecureKeyboardHost(child: child ?? const SizedBox.shrink());
+        return ResponsiveFrame(
+          child: SecureKeyboardHost(
+            child: child ?? const SizedBox.shrink(),
+          ),
+        );
       },
     );
   }
@@ -398,10 +403,17 @@ class _UnlockVaultScreenMultiState extends State<UnlockVaultScreenMulti> {
   }
 
   Future<void> _unlock() async {
-    if (_passphraseController.text.isEmpty) return;
+    if (SecurePassphrase.controllerIsEmpty(_passphraseController)) return;
+    if (!SecurePassphrase.controllerWithinLimit(_passphraseController)) {
+      setState(() => _error =
+          'Passphrase exceeds ${SecurePassphrase.maxBytes} UTF-8 bytes');
+      return;
+    }
 
     // Hide secure keyboard before starting unlock
     SecureKeyboard.hide();
+    final passphrase = SecurePassphrase.fromController(_passphraseController);
+    SecurePassphrase.clearController(_passphraseController);
 
     setState(() {
       _isLoading = true;
@@ -415,12 +427,10 @@ class _UnlockVaultScreenMultiState extends State<UnlockVaultScreenMulti> {
 
       await VaultChannel.openVaultById(
         vaultId: widget.vaultId,
-        password: _passphraseController.text,
+        password: passphrase,
       );
       vaultOpened = true;
       SecureLogger.d('UnlockVault', 'Vault opened successfully');
-
-      SecurePassphrase.clearController(_passphraseController);
 
       // Biometric is ALWAYS required for vault unlock
       SecureLogger.d('UnlockVault', 'Requesting biometric auth');
@@ -449,6 +459,7 @@ class _UnlockVaultScreenMultiState extends State<UnlockVaultScreenMulti> {
         }
       });
     } finally {
+      SecurePassphrase.zeroize(passphrase);
       if (vaultOpened && !unlockCompleted) {
         try {
           await VaultChannel.closeVault();
@@ -539,6 +550,7 @@ class _UnlockVaultScreenMultiState extends State<UnlockVaultScreenMulti> {
                   CyberTextField(
                     controller: _passphraseController,
                     obscureText: _obscurePassphrase,
+                    secureInput: true,
                     enabled: !_isLoading,
                     labelText: 'Passphrase',
                     onSubmitted: (_) => _unlock(),

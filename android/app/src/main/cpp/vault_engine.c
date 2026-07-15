@@ -80,6 +80,7 @@ void vault_free_entry(vault_entry_t* entry) {
         vault_zeroize(entry->chunks, entry->chunk_count * sizeof(entry->chunks[0]));
         free(entry->chunks);
     }
+    vault_zeroize(entry, sizeof(*entry));
 }
 
 int vault_is_open(void) {

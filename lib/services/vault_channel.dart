@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 import 'package:flutter/services.dart';
 
 /// VaultChannel - Flutter Platform Channel Bridge
@@ -52,13 +51,18 @@ class VaultChannel {
     return await _channel.invokeMethod<bool>('isVaultOpen') ?? false;
   }
 
+  static Future<Map<String, dynamic>> getKdfInfo() async {
+    final result = await _channel.invokeMethod<Map>('getKdfInfo');
+    return Map<String, dynamic>.from(result ?? const {});
+  }
+
   /// Create a new vault with passphrase
-  static Future<void> createVault(String passphrase) async {
+  static Future<void> createVault(Uint8List passphrase) async {
     await _channel.invokeMethod('createVault', {'passphrase': passphrase});
   }
 
   /// Open vault with passphrase
-  static Future<void> openVault(String passphrase) async {
+  static Future<void> openVault(Uint8List passphrase) async {
     await _channel.invokeMethod('openVault', {'passphrase': passphrase});
   }
 
@@ -365,27 +369,29 @@ class VaultChannel {
   }
 
   /// Verify password matches the current vault
-  static Future<bool> verifyPassword(String password) async {
+  static Future<bool> verifyPassword(Uint8List password) async {
     try {
       return await _channel
               .invokeMethod<bool>('verifyPassword', {'password': password}) ??
           false;
-    } on PlatformException {
-      return false;
+    } on PlatformException catch (error) {
+      if (error.code == 'AUTH_FAILED') return false;
+      rethrow;
     }
   }
 
   /// Change vault password (requires current password verification)
   static Future<bool> changePassword(
-      String currentPassword, String newPassword) async {
+      Uint8List currentPassword, Uint8List newPassword) async {
     try {
       return await _channel.invokeMethod<bool>('changePassword', {
             'currentPassword': currentPassword,
             'newPassword': newPassword,
           }) ??
           false;
-    } on PlatformException {
-      return false;
+    } on PlatformException catch (error) {
+      if (error.code == 'AUTH_FAILED') return false;
+      rethrow;
     }
   }
 
@@ -406,7 +412,7 @@ class VaultChannel {
   /// Throws PlatformException on failure with error details
   static Future<Map<String, dynamic>?> createVaultWithTitle({
     required String title,
-    required String password,
+    required Uint8List password,
   }) async {
     final result = await _channel.invokeMethod<Map>('createVaultWithTitle', {
       'title': title,
@@ -451,68 +457,52 @@ class VaultChannel {
   /// Import vault from URI (with progress via TransferProgressService)
   /// Use after pickVaultFile() to import with progress indicator
   static Future<Map<String, dynamic>?> importVaultFromUri(String uri) async {
-    try {
-      final result =
-          await _channel.invokeMethod<Map>('importVaultFromUri', {'uri': uri});
-      return result != null ? Map<String, dynamic>.from(result) : null;
-    } on PlatformException {
-      return null;
-    }
+    final result =
+        await _channel.invokeMethod<Map>('importVaultFromUri', {'uri': uri});
+    return result != null ? Map<String, dynamic>.from(result) : null;
   }
 
   /// Get decrypted vault title (requires password)
   static Future<String?> getVaultTitle({
     required String vaultId,
-    required String password,
+    required Uint8List password,
   }) async {
-    try {
-      return await _channel.invokeMethod<String>('getVaultTitle', {
-        'vaultId': vaultId,
-        'password': password,
-      });
-    } on PlatformException {
-      return null;
-    }
+    return await _channel.invokeMethod<String>('getVaultTitle', {
+      'vaultId': vaultId,
+      'password': password,
+    });
   }
 
   /// Set vault title (requires password, encrypts new title)
   static Future<bool> setVaultTitle({
     required String vaultId,
-    required String password,
+    required Uint8List password,
     required String newTitle,
   }) async {
-    try {
-      return await _channel.invokeMethod<bool>('setVaultTitle', {
-            'vaultId': vaultId,
-            'password': password,
-            'newTitle': newTitle,
-          }) ??
-          false;
-    } on PlatformException {
-      return false;
-    }
+    return await _channel.invokeMethod<bool>('setVaultTitle', {
+          'vaultId': vaultId,
+          'password': password,
+          'newTitle': newTitle,
+        }) ??
+        false;
   }
 
   /// Delete a vault completely
   static Future<bool> deleteVault({
     required String vaultId,
-    required String password,
+    required Uint8List password,
   }) async {
-    try {
-      return await _channel.invokeMethod<bool>('deleteVaultById', {
-            'vaultId': vaultId,
-            'password': password,
-          }) ??
-          false;
-    } on PlatformException {
-      return false;
-    }
+    return await _channel.invokeMethod<bool>('deleteVaultById', {
+          'vaultId': vaultId,
+          'password': password,
+        }) ??
+        false;
   }
 
   /// Open a specific vault by ID
   static Future<void> openVaultById({
     required String vaultId,
-    required String password,
+    required Uint8List password,
   }) async {
     await _channel.invokeMethod('openVaultById', {
       'vaultId': vaultId,

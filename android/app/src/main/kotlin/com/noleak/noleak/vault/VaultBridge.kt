@@ -62,11 +62,15 @@ class VaultBridge private constructor(private val context: Context) {
     fun isVaultOpen(): Boolean {
         return vaultEngine.isOpen()
     }
+
+    fun getKdfInfo(): Map<String, Any> = vaultEngine.getKdfInfo()
+
+    fun getCurrentVaultPath(): String? = vaultEngine.getCurrentVaultPath()
     
     /**
      * Create a new vault (with security check)
      */
-    suspend fun createVault(passphrase: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun createVault(passphrase: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
         if (!checkEnvironment()) {
             return@withContext Result.failure(SecurityException("Environment not supported"))
         }
@@ -79,7 +83,7 @@ class VaultBridge private constructor(private val context: Context) {
     /**
      * Open vault (with security check)
      */
-    suspend fun openVault(passphrase: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun openVault(passphrase: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
         if (!checkEnvironment()) {
             return@withContext Result.failure(SecurityException("Environment not supported"))
         }
@@ -525,9 +529,9 @@ class VaultBridge private constructor(private val context: Context) {
     /**
      * Verify password without opening vault
      */
-    suspend fun verifyPassword(password: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun verifyPassword(password: ByteArray): Result<Boolean> = withContext(Dispatchers.IO) {
         if (!checkEnvironment()) {
-            return@withContext false
+            return@withContext Result.failure(SecurityException("Environment not supported"))
         }
         mutex.withLock {
             vaultEngine.verifyPassword(password)
@@ -537,9 +541,9 @@ class VaultBridge private constructor(private val context: Context) {
     /**
      * Change vault password (vault must be open)
      */
-    suspend fun changePassword(currentPassword: String, newPassword: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun changePassword(currentPassword: ByteArray, newPassword: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
         if (!checkEnvironment()) {
-            return@withContext false
+            return@withContext Result.failure(SecurityException("Environment not supported"))
         }
         mutex.withLock {
             vaultEngine.changePassword(currentPassword, newPassword)
@@ -551,7 +555,7 @@ class VaultBridge private constructor(private val context: Context) {
     /**
      * Create a vault at a specific path (for multi-vault support)
      */
-    suspend fun createVaultAtPath(path: String, passphrase: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun createVaultAtPath(path: String, passphrase: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
         if (!checkEnvironment()) {
             return@withContext Result.failure(SecurityException("Environment not supported"))
         }
@@ -564,7 +568,7 @@ class VaultBridge private constructor(private val context: Context) {
     /**
      * Open a vault at a specific path (for multi-vault support)
      */
-    suspend fun openVaultAtPath(path: String, passphrase: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun openVaultAtPath(path: String, passphrase: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
         if (!checkEnvironment()) {
             return@withContext Result.failure(SecurityException("Environment not supported"))
         }

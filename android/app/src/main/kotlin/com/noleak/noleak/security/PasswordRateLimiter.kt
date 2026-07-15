@@ -55,8 +55,7 @@ class PasswordRateLimiter private constructor(context: Context) {
     @Synchronized
     fun isLockedOut(vaultId: String? = null): Boolean {
         if (getRemainingLockoutMs(vaultId) <= 0L) {
-            // Lockout expired, reset
-            reset(vaultId)
+            clearLockout(vaultId)
             return false
         }
         return true
@@ -98,7 +97,7 @@ class PasswordRateLimiter private constructor(context: Context) {
         
         // Calculate backoff: exponential with cap
         val backoffMs = minOf(
-            BASE_BACKOFF_MS * (1L shl (failedAttempts - 1)),
+            BASE_BACKOFF_MS * (1L shl (failedAttempts - 1).coerceAtMost(10)),
             MAX_BACKOFF_MS
         )
         
@@ -155,6 +154,15 @@ class PasswordRateLimiter private constructor(context: Context) {
             putInt(key(vaultId, KEY_FAILED_ATTEMPTS), 0)
             putLong(key(vaultId, KEY_LAST_ATTEMPT_WALL), 0)
             putLong(key(vaultId, KEY_LAST_ATTEMPT_ELAPSED), 0)
+            putLong(key(vaultId, KEY_LOCKED_UNTIL_WALL), 0)
+            putLong(key(vaultId, KEY_LOCKED_UNTIL_ELAPSED), 0)
+            apply()
+        }
+    }
+
+    @Synchronized
+    private fun clearLockout(vaultId: String? = null) {
+        prefs.edit().apply {
             putLong(key(vaultId, KEY_LOCKED_UNTIL_WALL), 0)
             putLong(key(vaultId, KEY_LOCKED_UNTIL_ELAPSED), 0)
             apply()

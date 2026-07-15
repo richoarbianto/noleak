@@ -83,8 +83,6 @@ class StreamingImportHandler(private val context: Context) {
         val validation = safFileHandler.validateFile(uri)
         if (validation !is SafFileHandler.FileValidationResult.Valid) {
             val error = when (validation) {
-                is SafFileHandler.FileValidationResult.UnsupportedType -> 
-                    "Unsupported file type: ${validation.mimeType}"
                 is SafFileHandler.FileValidationResult.TooLarge -> 
                     "File too large: ${validation.size} bytes"
                 SafFileHandler.FileValidationResult.UnknownSize ->

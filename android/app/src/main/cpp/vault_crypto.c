@@ -25,20 +25,36 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #endif
 
-// New vaults always use the high KDF profile. Existing vaults are opened with
-// the parameters stored in their header.
+// These globals select parameters for new vaults only. Existing vaults use the
+// exact parameters stored in their header.
 static size_t g_kdf_mem = VAULT_KDF_MEM_HIGH;
 static uint32_t g_kdf_iter = VAULT_KDF_ITER_HIGH;
 static uint32_t g_kdf_parallel = VAULT_KDF_PARALLEL_HIGH;
-static int g_kdf_profile_set = 0;
 
-void vault_set_kdf_profile_by_ram(size_t total_ram_mb) {
-  (void)total_ram_mb;
-  g_kdf_mem = VAULT_KDF_MEM_HIGH;
-  g_kdf_iter = VAULT_KDF_ITER_HIGH;
-  g_kdf_parallel = VAULT_KDF_PARALLEL_HIGH;
-  LOGI("KDF profile: HIGH");
-  g_kdf_profile_set = 1;
+static void apply_kdf_profile(vault_kdf_profile_t profile) {
+  if (profile == KDF_PROFILE_LOW) {
+    g_kdf_mem = VAULT_KDF_MEM_LOW;
+    g_kdf_iter = VAULT_KDF_ITER_LOW;
+    g_kdf_parallel = VAULT_KDF_PARALLEL_LOW;
+  } else if (profile == KDF_PROFILE_MEDIUM) {
+    g_kdf_mem = VAULT_KDF_MEM_MEDIUM;
+    g_kdf_iter = VAULT_KDF_ITER_MEDIUM;
+    g_kdf_parallel = VAULT_KDF_PARALLEL_MEDIUM;
+  } else {
+    g_kdf_mem = VAULT_KDF_MEM_HIGH;
+    g_kdf_iter = VAULT_KDF_ITER_HIGH;
+    g_kdf_parallel = VAULT_KDF_PARALLEL_HIGH;
+  }
+}
+
+void vault_set_kdf_profile_by_ram(size_t total_ram_mb, size_t available_ram_mb,
+                                  int is_low_ram_device,
+                                  int is_64_bit_process) {
+  vault_kdf_profile_t profile = vault_select_kdf_profile(
+      total_ram_mb, available_ram_mb, is_low_ram_device, is_64_bit_process);
+  apply_kdf_profile(profile);
+  LOGI("KDF profile: %d (%zu MB)", profile,
+       g_kdf_mem / (1024 * 1024));
 }
 
 void vault_get_kdf_params(size_t *mem_out, uint32_t *iter_out,
@@ -58,21 +74,29 @@ int vault_kdf_derive(const uint8_t *passphrase, size_t pass_len,
     return VAULT_ERR_INVALID_PARAM;
   }
 
-  // Use Argon2id with the minimum promised parameters for new vaults.
-  int result = crypto_pwhash(key_out, VAULT_KEY_LEN, (const char *)passphrase,
-                             pass_len, salt,
-                             g_kdf_iter, // Adaptive: 3-12 iterations
-                             g_kdf_mem,  // Adaptive: 32-256 MB
-                             crypto_pwhash_ALG_ARGON2ID13);
+  while (1) {
+    int result = crypto_pwhash(
+        key_out, VAULT_KEY_LEN, (const char *)passphrase, pass_len, salt,
+        g_kdf_iter, g_kdf_mem, crypto_pwhash_ALG_ARGON2ID13);
+    if (result == 0) {
+      LOGI("KDF derived key (mem=%zuMB, iter=%u)",
+           g_kdf_mem / (1024 * 1024), g_kdf_iter);
+      return VAULT_OK;
+    }
 
-  if (result != 0) {
-    LOGE("Argon2id KDF failed (OOM with %zu MB)", g_kdf_mem / (1024 * 1024));
-    return VAULT_ERR_MEMORY;
+    sodium_memzero(key_out, VAULT_KEY_LEN);
+    if (g_kdf_mem == VAULT_KDF_MEM_HIGH) {
+      apply_kdf_profile(KDF_PROFILE_MEDIUM);
+    } else if (g_kdf_mem == VAULT_KDF_MEM_MEDIUM) {
+      apply_kdf_profile(KDF_PROFILE_LOW);
+    } else {
+      LOGE("Argon2id KDF failed (OOM with %zu MB)",
+           g_kdf_mem / (1024 * 1024));
+      return VAULT_ERR_MEMORY;
+    }
+    LOGI("KDF allocation failed; retrying create with %zu MB",
+         g_kdf_mem / (1024 * 1024));
   }
-
-  LOGI("KDF derived key (mem=%zuMB, iter=%u)", g_kdf_mem / (1024 * 1024),
-       g_kdf_iter);
-  return VAULT_OK;
 }
 
 /**

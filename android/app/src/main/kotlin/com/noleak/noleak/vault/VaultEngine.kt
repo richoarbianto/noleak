@@ -64,9 +64,17 @@ class VaultEngine private constructor(private val context: Context) {
     
     // Native methods
     private external fun nativeInit(): Int
-    private external fun nativeSetKdfProfile(totalRamMb: Long)
+    private external fun nativeSetKdfProfile(
+        totalRamMb: Long,
+        availableRamMb: Long,
+        isLowRamDevice: Boolean,
+        is64BitProcess: Boolean
+    )
+    private external fun nativeGetKdfInfo(): LongArray?
+    private external fun nativeInspectKdfInfo(path: String): LongArray?
     private external fun nativeCreate(path: String, passphrase: ByteArray): Int
     private external fun nativeOpen(path: String, passphrase: ByteArray): Int
+    private external fun nativeVerifyPassword(passphrase: ByteArray): Int
     private external fun nativeClose()
     private external fun nativeIsOpen(): Boolean
     private external fun nativeImportFile(data: ByteArray, type: Int, name: String, mime: String?): ByteArray?
@@ -105,9 +113,7 @@ class VaultEngine private constructor(private val context: Context) {
         
         // SECURITY: Set adaptive KDF profile based on device RAM BEFORE init
         // This ensures proper memory settings even if init has issues
-        val totalRamMb = getTotalRamMb()
-        nativeSetKdfProfile(totalRamMb)
-        SecureLog.i("VaultEngine", "Set KDF profile for ${totalRamMb}MB RAM device")
+        configureKdfProfile()
         
         val result = nativeInit()
         if (result != VAULT_OK) {
@@ -122,16 +128,38 @@ class VaultEngine private constructor(private val context: Context) {
     /**
      * Get device total RAM in megabytes
      */
-    private fun getTotalRamMb(): Long {
+    private data class MemoryProfileInput(
+        val totalRamMb: Long,
+        val availableRamMb: Long,
+        val isLowRam: Boolean,
+        val is64Bit: Boolean
+    )
+
+    private fun getMemoryProfileInput(): MemoryProfileInput {
         return try {
             val activityManager = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
             val memInfo = android.app.ActivityManager.MemoryInfo()
             activityManager.getMemoryInfo(memInfo)
-            memInfo.totalMem / (1024 * 1024)
+            MemoryProfileInput(
+                totalRamMb = memInfo.totalMem / (1024 * 1024),
+                availableRamMb = memInfo.availMem / (1024 * 1024),
+                isLowRam = activityManager.isLowRamDevice || memInfo.lowMemory,
+                is64Bit = android.os.Process.is64Bit()
+            )
         } catch (e: Exception) {
-            // Default to high profile if we can't detect
-            4096
+            MemoryProfileInput(0, 0, true, false)
         }
+    }
+
+    private fun configureKdfProfile() {
+        val memory = getMemoryProfileInput()
+        nativeSetKdfProfile(
+            memory.totalRamMb,
+            memory.availableRamMb,
+            memory.isLowRam,
+            memory.is64Bit
+        )
+        SecureLog.i("VaultEngine", "Selected KDF profile for ${memory.totalRamMb}MB RAM device")
     }
     
     /**
@@ -156,9 +184,9 @@ class VaultEngine private constructor(private val context: Context) {
      * Create a new vault
      * SECURITY: Passphrase bytes are zeroized after use
      */
-    fun create(passphrase: String): Result<Unit> {
-        
-        val passBytes = passphrase.toByteArray(Charsets.UTF_8)
+    fun create(passphrase: ByteArray): Result<Unit> {
+        configureKdfProfile()
+        val passBytes = passphrase.copyOf()
         return try {
             val result = nativeCreate(getVaultPath(), passBytes)
             if (result == VAULT_OK) {
@@ -175,10 +203,9 @@ class VaultEngine private constructor(private val context: Context) {
      * Open an existing vault (legacy single-vault mode)
      * SECURITY: Passphrase bytes are zeroized after use
      */
-    fun open(passphrase: String): Result<Unit> {
-        
+    fun open(passphrase: ByteArray): Result<Unit> {
         val path = getVaultPath()
-        val passBytes = passphrase.toByteArray(Charsets.UTF_8)
+        val passBytes = passphrase.copyOf()
         return try {
             val result = nativeOpen(path, passBytes)
             if (result == VAULT_OK) {
@@ -196,9 +223,9 @@ class VaultEngine private constructor(private val context: Context) {
      * Create a vault at a specific path (for multi-vault support)
      * SECURITY: Passphrase bytes are zeroized after use
      */
-    fun createAtPath(path: String, passphrase: String): Result<Unit> {
-        
-        val passBytes = passphrase.toByteArray(Charsets.UTF_8)
+    fun createAtPath(path: String, passphrase: ByteArray): Result<Unit> {
+        configureKdfProfile()
+        val passBytes = passphrase.copyOf()
         return try {
             val result = nativeCreate(path, passBytes)
             if (result == VAULT_OK) {
@@ -215,9 +242,8 @@ class VaultEngine private constructor(private val context: Context) {
      * Open a vault at a specific path (for multi-vault support)
      * SECURITY: Passphrase bytes are zeroized after use
      */
-    fun openAtPath(path: String, passphrase: String): Result<Unit> {
-        
-        val passBytes = passphrase.toByteArray(Charsets.UTF_8)
+    fun openAtPath(path: String, passphrase: ByteArray): Result<Unit> {
+        val passBytes = passphrase.copyOf()
         return try {
             val result = nativeOpen(path, passBytes)
             if (result == VAULT_OK) {
@@ -249,6 +275,43 @@ class VaultEngine private constructor(private val context: Context) {
      */
     fun isOpen(): Boolean {
         return nativeIsOpen()
+    }
+
+    fun getKdfInfo(): Map<String, Any> {
+        val values = nativeGetKdfInfo() ?: longArrayOf(0, 0, 0, 0)
+        return mapOf(
+            "memoryMiB" to values[0] / (1024 * 1024),
+            "opslimit" to values[1],
+            "parallelism" to 1L,
+            "storedParallelism" to values[2],
+            "storedProfile" to (values[3] == 1L)
+        )
+    }
+
+    fun inspectVaultKdfInfo(path: String): Result<Map<String, Any>> {
+        configureKdfProfile()
+        val values = nativeInspectKdfInfo(path)
+            ?: return Result.failure(
+                VaultException("Vault header is invalid or corrupted", VAULT_ERR_CORRUPTED)
+            )
+        if (values.size < 6) {
+            return Result.failure(
+                VaultException("Vault KDF metadata is incomplete", VAULT_ERR_CORRUPTED)
+            )
+        }
+
+        val importedMemoryMiB = values[0] / (1024 * 1024)
+        val deviceMemoryMiB = values[3] / (1024 * 1024)
+        return Result.success(mapOf(
+            "kdfMemoryMiB" to importedMemoryMiB,
+            "kdfOpslimit" to values[1],
+            "kdfParallelism" to values[2],
+            "deviceKdfMemoryMiB" to deviceMemoryMiB,
+            "deviceKdfOpslimit" to values[4],
+            "deviceKdfParallelism" to values[5],
+            "kdfExceedsDevice" to
+                (importedMemoryMiB > deviceMemoryMiB || values[1] > values[4])
+        ))
     }
     
     /**
@@ -344,35 +407,35 @@ class VaultEngine private constructor(private val context: Context) {
 
     /**
      * Verify password without changing vault state
-     * If vault is already open, this will temporarily close and reopen
+     * An open vault is verified in place; a closed vault is opened temporarily.
      * Uses the currently tracked vault path for multi-vault support
      * SECURITY: Password bytes are zeroized after use
      */
-    fun verifyPassword(password: String): Boolean {
+    fun verifyPassword(password: ByteArray): Result<Boolean> {
 
         val wasOpen = nativeIsOpen()
         val pathToVerify = currentVaultPath ?: getVaultPath()
-        val passBytes = password.toByteArray(Charsets.UTF_8)
+        val passBytes = password.copyOf()
         
         SecureLog.d("VaultEngine", "verifyPassword: wasOpen=$wasOpen")
         
         return try {
             if (wasOpen) {
-                nativeClose()
-                val result = nativeOpen(pathToVerify, passBytes)
+                val result = nativeVerifyPassword(passBytes)
                 if (result == VAULT_OK) {
-                    currentVaultPath = pathToVerify
-                    true
+                    Result.success(true)
                 } else {
-                    false
+                    if (result == VAULT_ERR_AUTH_FAIL) Result.success(false)
+                    else Result.failure(VaultException.fromCode(result))
                 }
             } else {
                 val result = nativeOpen(pathToVerify, passBytes)
                 if (result == VAULT_OK) {
                     nativeClose()
-                    true
+                    Result.success(true)
                 } else {
-                    false
+                    if (result == VAULT_ERR_AUTH_FAIL) Result.success(false)
+                    else Result.failure(VaultException.fromCode(result))
                 }
             }
         } finally {
@@ -385,20 +448,21 @@ class VaultEngine private constructor(private val context: Context) {
      * Verifies old password, re-encrypts master key with new password, updates vault file
      * SECURITY: Password bytes are zeroized after use
      */
-    fun changePassword(currentPassword: String, newPassword: String): Boolean {
+    fun changePassword(currentPassword: ByteArray, newPassword: ByteArray): Result<Unit> {
         if (!nativeIsOpen()) {
             SecureLog.e("VaultEngine", "changePassword: Vault not open")
-            return false
+            return Result.failure(VaultException.fromCode(VAULT_ERR_NOT_OPEN))
         }
         
-        val currentBytes = currentPassword.toByteArray(Charsets.UTF_8)
-        val newBytes = newPassword.toByteArray(Charsets.UTF_8)
+        val currentBytes = currentPassword.copyOf()
+        val newBytes = newPassword.copyOf()
         
         return try {
             SecureLog.i("VaultEngine", "changePassword: Processing...")
             val result = nativeChangePassword(currentBytes, newBytes)
             SecureLog.i("VaultEngine", "changePassword: Complete")
-            result == VAULT_OK
+            if (result == VAULT_OK) Result.success(Unit)
+            else Result.failure(VaultException.fromCode(result))
         } finally {
             secureZeroize(currentBytes)
             secureZeroize(newBytes)

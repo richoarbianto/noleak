@@ -1,17 +1,18 @@
 /// TextViewerScreen - Secure Text File Display
-/// 
+///
 /// Displays encrypted text files from the vault in a read-only view.
 /// Text content is decrypted into memory and displayed without creating
 /// any temporary files on disk.
-/// 
+///
 /// SECURITY:
-/// - Content stored as Uint8List (not String) for secure zeroization
+/// - Source bytes are stored as Uint8List for best-effort zeroization
 /// - Zeroized on dispose
 /// - FLAG_SECURE prevents screenshots
 /// - No copy/share functionality (intentional)
-/// - Preview limited to 1MB for large files
+/// - Text preview is limited to 1 MiB
+/// - Unknown formats use a sanitized 4,096-character raw preview
 /// - Environment check before display
-/// 
+///
 /// Supports text files, source code, configuration files, etc.
 
 import 'dart:convert';
@@ -21,10 +22,36 @@ import '../models/vault_state.dart';
 import '../services/vault_channel.dart';
 import '../utils/secure_passphrase.dart';
 
+const int rawPreviewMaxCharacters = 4096;
+
+String buildSafeRawPreview(Uint8List data,
+    {int maxCharacters = rawPreviewMaxCharacters}) {
+  final decoded = utf8.decode(data, allowMalformed: true);
+  final output = StringBuffer();
+  var count = 0;
+  for (final rune in decoded.runes) {
+    if (count >= maxCharacters) break;
+    final formatControl = (rune >= 0x200b && rune <= 0x200f) ||
+        (rune >= 0x202a && rune <= 0x202e) ||
+        (rune >= 0x2060 && rune <= 0x206f) ||
+        rune == 0xfeff;
+    final allowed = rune == 0x09 ||
+        rune == 0x0a ||
+        rune == 0x0d ||
+        (rune >= 0x20 &&
+            rune != 0x7f &&
+            !(rune >= 0x80 && rune <= 0x9f) &&
+            !formatControl);
+    output.writeCharCode(allowed ? rune : 0xfffd);
+    count++;
+  }
+  return output.toString();
+}
+
 /// Secure text viewer for encrypted vault files.
-/// 
+///
 /// FLAG_SECURE is set globally in MainActivity to prevent screenshots.
-/// 
+///
 /// SECURITY:
 /// - Stores content as Uint8List, not String (String is immutable)
 /// - Zeroizes content on dispose
@@ -38,14 +65,16 @@ class TextViewerScreen extends StatefulWidget {
 }
 
 class _TextViewerScreenState extends State<TextViewerScreen> {
-  static const int _maxPreviewBytes = 1024 * 1024; // 1MB limit
-  
+  static const int _maxTextPreviewBytes = 1024 * 1024;
+  static const int _maxRawPreviewBytes = rawPreviewMaxCharacters * 4;
+
   bool _isLoading = true;
-  Uint8List? _contentBytes;  // SECURITY: Use bytes, not String
+  Uint8List? _contentBytes; // SECURITY: Use bytes, not String
   String? _error;
   String? _displayText;
   bool _isTruncated = false;
   int _totalSize = 0;
+  bool _isRawPreview = false;
 
   @override
   void initState() {
@@ -55,7 +84,7 @@ class _TextViewerScreenState extends State<TextViewerScreen> {
 
   Future<void> _checkSecurityAndLoadContent() async {
     setState(() => _isLoading = true);
-    
+
     try {
       // Security check before viewing content (PRD Req 2.5)
       final isSecure = await VaultChannel.checkEnvironment();
@@ -68,7 +97,7 @@ class _TextViewerScreenState extends State<TextViewerScreen> {
         }
         return;
       }
-      
+
       await _loadContent();
     } catch (e) {
       if (mounted) {
@@ -90,37 +119,52 @@ class _TextViewerScreenState extends State<TextViewerScreen> {
   }
 
   Future<void> _loadContent() async {
+    final useRawPreview = !widget.entry.isTextLike && !widget.entry.isCsv;
     try {
       final preview = await VaultChannel.readTextPreview(
         widget.entry.fileId,
-        maxBytes: _maxPreviewBytes,
+        maxBytes: useRawPreview ? _maxRawPreviewBytes : _maxTextPreviewBytes,
       );
-      
+
       final data = preview['data'] as Uint8List;
       final truncated = preview['truncated'] as bool? ?? false;
       final totalSize = preview['totalSize'] as int? ?? data.length;
-      
-      try {
-        final text = utf8.decode(data, allowMalformed: false);
-        setState(() {
-          _contentBytes = data;
-          _displayText = text;
-          _isTruncated = truncated;
-          _totalSize = totalSize;
-          _isLoading = false;
-        });
-      } catch (_) {
+
+      if (!mounted) {
         SecurePassphrase.zeroize(data);
+        return;
+      }
+
+      var rawPreview = useRawPreview;
+      String text;
+      if (rawPreview) {
+        text = buildSafeRawPreview(data);
+      } else {
+        try {
+          text = utf8.decode(data, allowMalformed: false);
+        } on FormatException {
+          rawPreview = true;
+          text = buildSafeRawPreview(data);
+        }
+      }
+
+      setState(() {
+        _contentBytes = data;
+        // Flutter needs an immutable String while text is visible. The mutable
+        // source bytes remain zeroizable and are cleared on dispose.
+        _displayText = text;
+        _isRawPreview = rawPreview;
+        _isTruncated = truncated;
+        _totalSize = totalSize;
+        _isLoading = false;
+      });
+    } catch (e) {
+      if (mounted) {
         setState(() {
-          _error = 'Text preview is not available for this file.';
+          _error = e.toString();
           _isLoading = false;
         });
       }
-    } catch (e) {
-      setState(() {
-        _error = e.toString();
-        _isLoading = false;
-      });
     }
   }
 
@@ -185,7 +229,7 @@ class _TextViewerScreenState extends State<TextViewerScreen> {
 
     return Column(
       children: [
-        if (_isTruncated)
+        if (_isRawPreview || _isTruncated)
           Container(
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -196,7 +240,10 @@ class _TextViewerScreenState extends State<TextViewerScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Preview only (1MB of ${_formatSize(_totalSize)})',
+                    _isRawPreview
+                        ? 'Raw preview · sanitized · up to 4,096 characters '
+                            'of ${_formatSize(_totalSize)}'
+                        : 'Preview only (1 MiB of ${_formatSize(_totalSize)})',
                     style: TextStyle(color: Colors.orange[300], fontSize: 13),
                   ),
                 ),

@@ -1,17 +1,17 @@
 /// CreateVaultScreen - New Vault Creation
-/// 
+///
 /// Allows users to create a new encrypted vault with a passphrase.
 /// Also provides option to import an existing vault file.
-/// 
+///
 /// PASSPHRASE REQUIREMENTS:
 /// - Minimum 12 characters
 /// - At least 1 number
 /// - At least 1 symbol
-/// 
+///
 /// The passphrase is used to derive the Key Encryption Key (KEK)
 /// via Argon2id, which then encrypts the randomly generated
 /// Master Key (MK).
-/// 
+///
 /// WARNING: There is NO password recovery. If the passphrase is
 /// forgotten, all data in the vault is permanently lost.
 
@@ -25,7 +25,7 @@ import '../services/transfer_progress_service.dart';
 import '../utils/secure_passphrase.dart';
 
 /// Screen for creating a new vault or importing an existing one.
-/// 
+///
 /// FLAG_SECURE is set globally in MainActivity to prevent screenshots.
 class CreateVaultScreen extends StatefulWidget {
   final VaultStateManager stateManager;
@@ -54,7 +54,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
   void initState() {
     super.initState();
     _transferProgressService.initialize();
-    _transferProgressSub = _transferProgressService.progressStream.listen((progress) {
+    _transferProgressSub =
+        _transferProgressService.progressStream.listen((progress) {
       if (!_isImporting || progress.operation != 'import_vault') return;
       if (mounted) {
         setState(() {
@@ -73,23 +74,30 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
   }
 
   double _getStrength() {
-    final pass = _passphraseController.text;
+    if (!SecurePassphrase.controllerWithinLimit(_passphraseController)) {
+      return 0;
+    }
+    final pass = SecurePassphrase.fromController(_passphraseController);
     if (pass.isEmpty) return 0;
 
-    double strength = 0;
+    try {
+      double strength = 0;
 
-    // Length contribution
-    if (pass.length >= minPassphraseLength) strength += 0.25;
-    if (pass.length >= 16) strength += 0.15;
-    if (pass.length >= 20) strength += 0.1;
+      if (pass.length >= minPassphraseLength) strength += 0.25;
+      if (pass.length >= 16) strength += 0.15;
+      if (pass.length >= 20) strength += 0.1;
 
-    // Character variety
-    if (RegExp(r'[a-z]').hasMatch(pass)) strength += 0.1;
-    if (RegExp(r'[A-Z]').hasMatch(pass)) strength += 0.1;
-    if (RegExp(r'[0-9]').hasMatch(pass)) strength += 0.15;
-    if (RegExp(r'[!@#$%^&*(),.?":{}|<>]').hasMatch(pass)) strength += 0.15;
+      if (pass.any((b) => b >= 0x61 && b <= 0x7a)) strength += 0.1;
+      if (pass.any((b) => b >= 0x41 && b <= 0x5a)) strength += 0.1;
+      if (pass.any((b) => b >= 0x30 && b <= 0x39)) strength += 0.15;
+      if (pass.any((b) => !((b >= 0x30 && b <= 0x39) ||
+          (b >= 0x41 && b <= 0x5a) ||
+          (b >= 0x61 && b <= 0x7a)))) strength += 0.15;
 
-    return strength.clamp(0, 1);
+      return strength.clamp(0, 1);
+    } finally {
+      SecurePassphrase.zeroize(pass);
+    }
   }
 
   Color _getStrengthColor() {
@@ -109,22 +117,19 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
   }
 
   bool _isValid() {
-    final pass = _passphraseController.text;
-    final confirm = _confirmController.text;
-    return _meetsPassphraseRules(pass) && pass == confirm;
+    return _meetsPassphraseRules() &&
+        SecurePassphrase.controllersMatch(
+          _passphraseController,
+          _confirmController,
+        );
   }
 
-  bool _meetsPassphraseRules(String pass) {
-    return pass.length >= minPassphraseLength && _hasNumber(pass) && _hasSymbol(pass);
-  }
-
-  bool _hasNumber(String pass) {
-    return RegExp(r'[0-9]').hasMatch(pass);
-  }
-
-  bool _hasSymbol(String pass) {
-    return RegExp(r'[^A-Za-z0-9]').hasMatch(pass);
-  }
+  bool _meetsPassphraseRules() =>
+      SecurePassphrase.controllerWithinLimit(_passphraseController) &&
+      SecurePassphrase.controllerLength(_passphraseController) >=
+          minPassphraseLength &&
+      SecurePassphrase.controllerHasNumber(_passphraseController) &&
+      SecurePassphrase.controllerHasSymbol(_passphraseController);
 
   Future<void> _createVault() async {
     if (!_isValid()) return;
@@ -136,15 +141,17 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
       _error = null;
     });
 
+    final passphrase = SecurePassphrase.fromController(_passphraseController);
+    SecurePassphrase.clearController(_passphraseController);
+    SecurePassphrase.clearController(_confirmController);
     try {
-      await widget.stateManager.createVault(_passphraseController.text);
-      SecurePassphrase.clearController(_passphraseController);
-      SecurePassphrase.clearController(_confirmController);
+      await widget.stateManager.createVault(passphrase);
     } catch (e) {
       setState(() {
         _error = e.toString();
       });
     } finally {
+      SecurePassphrase.zeroize(passphrase);
       setState(() {
         _isLoading = false;
       });
@@ -166,7 +173,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: const Text('Vault imported! Please unlock with your password.'),
+              content: const Text(
+                  'Vault imported! Please unlock with your password.'),
               backgroundColor: Colors.green[700],
             ),
           );
@@ -240,7 +248,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                 obscureText: _obscurePassphrase,
                 readOnly: AppSettings.instance.secureKeyboardEnabled,
                 showCursor: true,
-                enableInteractiveSelection: !AppSettings.instance.secureKeyboardEnabled,
+                enableInteractiveSelection:
+                    !AppSettings.instance.secureKeyboardEnabled,
                 autocorrect: false,
                 enableSuggestions: false,
                 onTap: () {
@@ -248,6 +257,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                     SecureKeyboard.show(
                       context,
                       controller: _passphraseController,
+                      secureInput: true,
+                      obscureText: _obscurePassphrase,
                       onChanged: (_) => setState(() {}),
                     );
                   }
@@ -257,7 +268,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                 decoration: InputDecoration(
                   labelText: 'Passphrase',
                   labelStyle: TextStyle(color: Colors.grey[400]),
-                  hintText: 'Min $minPassphraseLength chars + 1 number + 1 symbol',
+                  hintText:
+                      'Min $minPassphraseLength chars + 1 number + 1 symbol',
                   hintStyle: TextStyle(color: Colors.grey[600]),
                   filled: true,
                   fillColor: Colors.grey[800],
@@ -267,21 +279,27 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                   ),
                   suffixIcon: IconButton(
                     icon: Icon(
-                      _obscurePassphrase ? Icons.visibility : Icons.visibility_off,
+                      _obscurePassphrase
+                          ? Icons.visibility
+                          : Icons.visibility_off,
                       color: Colors.grey[400],
                     ),
                     onPressed: () {
                       setState(() {
                         _obscurePassphrase = !_obscurePassphrase;
                       });
+                      SecureKeyboard.setObscured(
+                        _passphraseController,
+                        _obscurePassphrase,
+                      );
                     },
                   ),
                 ),
               ),
               const SizedBox(height: 8),
 
-              if (_passphraseController.text.isNotEmpty &&
-                  !_meetsPassphraseRules(_passphraseController.text))
+              if (!SecurePassphrase.controllerIsEmpty(_passphraseController) &&
+                  !_meetsPassphraseRules())
                 Padding(
                   padding: const EdgeInsets.only(bottom: 8),
                   child: Text(
@@ -292,7 +310,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                 ),
 
               // Strength indicator
-              if (_passphraseController.text.isNotEmpty) ...[
+              if (!SecurePassphrase.controllerIsEmpty(
+                  _passphraseController)) ...[
                 Row(
                   children: [
                     Expanded(
@@ -321,7 +340,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                 obscureText: _obscureConfirm,
                 readOnly: AppSettings.instance.secureKeyboardEnabled,
                 showCursor: true,
-                enableInteractiveSelection: !AppSettings.instance.secureKeyboardEnabled,
+                enableInteractiveSelection:
+                    !AppSettings.instance.secureKeyboardEnabled,
                 autocorrect: false,
                 enableSuggestions: false,
                 onTap: () {
@@ -329,6 +349,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                     SecureKeyboard.show(
                       context,
                       controller: _confirmController,
+                      secureInput: true,
+                      obscureText: _obscureConfirm,
                       onChanged: (_) => setState(() {}),
                     );
                   }
@@ -353,12 +375,20 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                       setState(() {
                         _obscureConfirm = !_obscureConfirm;
                       });
+                      SecureKeyboard.setObscured(
+                        _confirmController,
+                        _obscureConfirm,
+                      );
                     },
                   ),
-                  errorText: _confirmController.text.isNotEmpty &&
-                          _passphraseController.text != _confirmController.text
-                      ? 'Passphrases do not match'
-                      : null,
+                  errorText:
+                      !SecurePassphrase.controllerIsEmpty(_confirmController) &&
+                              !SecurePassphrase.controllersMatch(
+                                _passphraseController,
+                                _confirmController,
+                              )
+                          ? 'Passphrases do not match'
+                          : null,
                 ),
               ),
               const SizedBox(height: 24),
@@ -384,7 +414,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                 children: [
                   Expanded(
                     child: ElevatedButton(
-                      onPressed: _isValid() && !_isLoading ? _createVault : null,
+                      onPressed:
+                          _isValid() && !_isLoading ? _createVault : null,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.blue[700],
                         foregroundColor: Colors.white,
@@ -420,7 +451,8 @@ class _CreateVaultScreenState extends State<CreateVaultScreen> {
                 decoration: BoxDecoration(
                   color: Colors.orange[900]?.withOpacity(0.2),
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.orange[700]!.withOpacity(0.5)),
+                  border:
+                      Border.all(color: Colors.orange[700]!.withOpacity(0.5)),
                 ),
                 child: Row(
                   children: [
