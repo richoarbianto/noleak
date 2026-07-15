@@ -30,7 +30,7 @@
 
 ## Status
 
-NoLeak is an Android-only project under active development. The current application version is `1.0.0` (`versionCode 1000`) and requires Android 7.0/API 24 or newer.
+NoLeak is an Android-only project under active development. The current application version is `1.0.1` (`versionCode 1001`) and requires Android 7.0/API 24 or newer.
 
 Packaged releases are available from [GitHub Releases](https://github.com/richoarbianto/noleak/releases/latest).
 
