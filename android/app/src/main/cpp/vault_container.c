@@ -2214,7 +2214,7 @@ int vault_save_index_only(void) {
   }
   snprintf(temp_path, path_len + 5, "%s.tmp", g_vault.path);
 
-  int fd_out = open(temp_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  int fd_out = open(temp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
   if (fd_out < 0) {
     free(temp_path);
     result = VAULT_ERR_IO;

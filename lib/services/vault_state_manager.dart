@@ -272,8 +272,10 @@ class VaultStateManager extends ChangeNotifier {
 
   /// Export encrypted vault container
   Future<bool> exportVault() async {
-    await _checkSecurity();
-    return await VaultChannel.exportVault();
+    return runWithFrozenTimers(() async {
+      await _checkSecurity();
+      return VaultChannel.exportVault();
+    });
   }
 
   /// Import encrypted vault container (replaces existing, locks state)

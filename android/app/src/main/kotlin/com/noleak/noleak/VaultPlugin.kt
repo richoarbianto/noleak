@@ -10,6 +10,7 @@ import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.system.Os
 import android.system.OsConstants
 import android.view.Surface
@@ -1652,23 +1653,76 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
     
     private suspend fun exportFileToUri(fileId: ByteArray, uri: Uri): Boolean {
         val ctx = activity ?: return false
-        var fileData: ByteArray? = null
+        var bytesWritten = 0L
+        var totalBytes = 0L
+        var lastPercent = -1
+
+        suspend fun reportProgress(isComplete: Boolean = false, error: String? = null) {
+            val percent = if (totalBytes > 0) {
+                ((bytesWritten * 100) / totalBytes).toInt()
+            } else {
+                0
+            }
+            if (!isComplete && error == null && percent == lastPercent) return
+            lastPercent = percent
+            withContext(Dispatchers.Main) {
+                emitTransferProgress(
+                    "export_file",
+                    bytesWritten,
+                    totalBytes,
+                    isComplete,
+                    error
+                )
+            }
+        }
+
         return try {
+            val entry = vaultBridge.listFiles().getOrThrow()
+                .firstOrNull { it.fileId.contentEquals(fileId) }
+                ?: throw IllegalStateException("File not found")
+            totalBytes = entry.size
+            reportProgress()
+
             withContext(Dispatchers.IO) {
-                fileData = vaultBridge.readFile(fileId).getOrThrow()
-                val data = fileData ?: return@withContext
-                ctx.contentResolver.openOutputStream(uri)?.use { output ->
-                    output.write(data)
+                val output = ctx.contentResolver.openOutputStream(uri)
+                    ?: throw IllegalStateException("Could not open export destination")
+                output.use {
+                    if (entry.chunkCount > 0) {
+                        for (chunkIndex in 0 until entry.chunkCount) {
+                            val chunk = vaultBridge.readChunk(fileId, chunkIndex).getOrThrow()
+                            try {
+                                output.write(chunk)
+                                bytesWritten += chunk.size
+                            } finally {
+                                SafFileHandler.secureZeroize(chunk)
+                            }
+                            reportProgress()
+                        }
+                    } else {
+                        val data = vaultBridge.readFile(fileId).getOrThrow()
+                        try {
+                            output.write(data)
+                            bytesWritten = data.size.toLong()
+                        } finally {
+                            SafFileHandler.secureZeroize(data)
+                        }
+                    }
+                    if (bytesWritten != totalBytes) {
+                        throw IllegalStateException("Export size mismatch")
+                    }
                     output.flush()
                 }
-                SecureLog.d("VaultPlugin", "exportFileToUri: export completed")
             }
+            reportProgress(isComplete = true)
+            SecureLog.d("VaultPlugin", "exportFileToUri: export completed")
             true
         } catch (e: Exception) {
-            SecureLog.e("VaultPlugin", "exportFileToUri: export failed: ${e.message}")
+            reportProgress(error = "Export failed")
+            withContext(Dispatchers.IO) {
+                runCatching { DocumentsContract.deleteDocument(ctx.contentResolver, uri) }
+            }
+            SecureLog.e("VaultPlugin", "exportFileToUri: export failed: ${e.javaClass.simpleName}")
             false
-        } finally {
-            fileData?.let { SafFileHandler.secureZeroize(it) }
         }
     }
 

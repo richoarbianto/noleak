@@ -104,6 +104,28 @@ void main() {
     );
   });
 
+  test('file export errors are visible to the caller', () async {
+    const channel = MethodChannel('com.noleak.vault');
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (_) async {
+      throw PlatformException(
+        code: 'EXPORT_FAILED',
+        message: 'Could not export file',
+      );
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+    await expectLater(
+      VaultChannel.exportFile(const [1, 2, 3, 4], 'file.bin'),
+      throwsA(isA<PlatformException>().having(
+        (error) => error.code,
+        'code',
+        'EXPORT_FAILED',
+      )),
+    );
+  });
+
   test('raw preview is sanitized, bounded, and keeps Unicode intact', () {
     final bytes = Uint8List.fromList([
       ...utf8.encode('start\u0000\u202e'),

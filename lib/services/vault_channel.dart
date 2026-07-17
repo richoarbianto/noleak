@@ -181,15 +181,11 @@ class VaultChannel {
   /// Export a decrypted file to external storage via SAF
   /// Returns true if export was successful, false if cancelled
   static Future<bool> exportFile(List<int> fileId, String suggestedName) async {
-    try {
-      return await _channel.invokeMethod<bool>('exportFile', {
-            'fileId': fileId,
-            'suggestedName': suggestedName,
-          }) ??
-          false;
-    } on PlatformException {
-      return false;
-    }
+    return await _channel.invokeMethod<bool>('exportFile', {
+          'fileId': fileId,
+          'suggestedName': suggestedName,
+        }) ??
+        false;
   }
 
   /// Get number of entries in vault

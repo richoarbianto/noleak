@@ -102,7 +102,8 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
     _transferProgressSub =
         _transferProgressService.progressStream.listen((progress) {
       if (!_isExporting) return;
-      if (progress.operation != 'export_vault') return;
+      if (progress.operation != 'export_vault' &&
+          progress.operation != 'export_file') return;
       if (mounted) {
         setState(() {
           _exportProgress = progress.normalized;
@@ -1094,7 +1095,11 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
 
     SecureLogger.d(
         'VaultHomeScreen', '_exportFile: user confirmed, starting export');
-    setState(() => _isVaultOp = true);
+    widget.stateManager.freezeTimers();
+    setState(() {
+      _isExporting = true;
+      _exportProgress = 0;
+    });
 
     // Keep screen awake during export
     await VaultChannel.enableWakelock();
@@ -1130,7 +1135,13 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
       await VaultChannel.disableWakelock();
       SecureLogger.d('VaultHomeScreen', '_exportFile: wakelock disabled');
 
-      if (mounted) setState(() => _isVaultOp = false);
+      widget.stateManager.unfreezeTimers();
+      if (mounted) {
+        setState(() {
+          _isExporting = false;
+          _exportProgress = null;
+        });
+      }
     }
   }
 
@@ -1496,7 +1507,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
       message: _isImporting
           ? (_isImportFinalizing ? 'Finalizing import...' : 'Importing...')
           : _isExporting
-              ? 'Exporting vault...'
+              ? 'Exporting...'
               : 'Processing...',
       progress: _isImporting
           ? _importProgress
