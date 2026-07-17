@@ -254,11 +254,19 @@ class _CryptoTab extends StatelessWidget {
                 ),
                 SizedBox(height: 12),
                 _AlgorithmItem(
-                  name: 'SHA-256',
-                  purpose: 'Corruption Check',
+                  name: 'Authenticated Root Journal',
+                  purpose: 'Atomic Container Commits',
                   details:
-                      'Checks container consistency. Cryptographic tamper detection is provided by the authenticated-encryption tags.',
+                      'Two root slots select the latest durable encrypted index. Root and index authentication is checked at unlock; each file or chunk is authenticated when read.',
                   icon: Icons.fact_check,
+                ),
+                SizedBox(height: 12),
+                _AlgorithmItem(
+                  name: 'SHA-256',
+                  purpose: 'Legacy and Fingerprint Hashing',
+                  details:
+                      'Used for IDs, source fingerprints, and consistency validation before migrating legacy VAULTv1 containers. Active data authentication is provided by AEAD.',
+                  icon: Icons.fingerprint,
                 ),
               ],
             ),
@@ -410,7 +418,7 @@ class _ProtectionTab extends StatelessWidget {
                   color: CyberpunkTheme.warning,
                   title: 'Flash Storage Deletion',
                   desc:
-                      'Vault deletion overwrites data before removal, but physical erasure is best-effort on flash storage because of wear leveling.',
+                      'File deletion retires its encrypted index key; orphaned ciphertext can remain until storage compaction. Whole-vault deletion attempts an overwrite, but physical erasure is best-effort on flash storage because of wear leveling.',
                 ),
                 _ProtectionItem(
                   icon: Icons.visibility,

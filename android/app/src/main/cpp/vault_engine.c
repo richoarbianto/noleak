@@ -94,6 +94,12 @@ void vault_close(void) {
     vault_zeroize(g_vault.vault_id, VAULT_ID_LEN);
     vault_zeroize(g_vault.wrapped_mk, sizeof(g_vault.wrapped_mk));
     g_vault.wrapped_mk_len = 0;
+    g_vault.container_format = 0;
+    g_vault.commit_sequence = 0;
+    g_vault.committed_size = 0;
+    g_vault.index_offset = 0;
+    g_vault.index_length = 0;
+    g_vault.active_root_slot = 0;
     g_vault.kdf_mem = 0;
     g_vault.kdf_iter = 0;
     g_vault.kdf_parallel = 0;

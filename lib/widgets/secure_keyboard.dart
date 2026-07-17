@@ -9,6 +9,7 @@
 /// - No autocomplete or suggestions
 /// - Keys are rendered in-app (not accessible to other apps)
 /// - Supports shift, caps lock, and symbol modes
+/// - Supports UTF-8-safe cursor navigation and editing
 /// - Backspace with hold-to-repeat functionality
 ///
 /// The keyboard is displayed as a bottom sheet and integrates with
@@ -81,6 +82,7 @@ class SecureKeyboard {
   static void setObscured(TextEditingController controller, bool obscureText) {
     final input = _inputs[controller];
     if (input == null) return;
+    _captureSelection(controller, input);
     input.obscured = obscureText;
     _renderSecureInput(controller, input);
   }
@@ -90,6 +92,7 @@ class SecureKeyboard {
     if (input == null) return;
     input.bytes.fillRange(0, input.bytes.length, 0);
     input.length = 0;
+    input.cursor = 0;
     _inputs[controller] = null;
   }
 
@@ -97,6 +100,7 @@ class SecureKeyboard {
       TextEditingController controller, bool obscureText) {
     final prepared = _inputs[controller];
     if (prepared != null) {
+      _captureSelection(controller, prepared);
       prepared.obscured = obscureText;
       _renderSecureInput(controller, prepared);
       return;
@@ -105,6 +109,12 @@ class SecureKeyboard {
     final existing = utf8.encode(controller.text);
     input.length = existing.length.clamp(0, _maxInputBytes);
     input.bytes.setRange(0, input.length, existing);
+    input.cursor = _byteOffsetForDisplayOffset(
+      controller.text,
+      controller.selection.isValid
+          ? controller.selection.extentOffset
+          : controller.text.length,
+    ).clamp(0, input.length);
     input.obscured = obscureText;
     existing.fillRange(0, existing.length, 0);
     _inputs[controller] = input;
@@ -118,8 +128,43 @@ class SecureKeyboard {
         : utf8.decode(Uint8List.sublistView(input.bytes, 0, input.length));
     controller.value = TextEditingValue(
       text: value,
-      selection: TextSelection.collapsed(offset: value.length),
+      selection: TextSelection.collapsed(
+        offset: input.obscured
+            ? input.characterCountBeforeCursor
+            : utf8
+                .decode(Uint8List.sublistView(input.bytes, 0, input.cursor))
+                .length,
+      ),
     );
+  }
+
+  static void _captureSelection(
+      TextEditingController controller, _SecureInputBuffer input) {
+    final selection = controller.selection;
+    if (!selection.isValid) return;
+    if (input.obscured) {
+      input.cursor = input.byteOffsetForCharacter(
+        selection.extentOffset.clamp(0, input.characterCount),
+      );
+      return;
+    }
+    input.cursor = _byteOffsetForDisplayOffset(
+      controller.text,
+      selection.extentOffset,
+    ).clamp(0, input.length);
+  }
+
+  static int _byteOffsetForDisplayOffset(String value, int displayOffset) {
+    final target = displayOffset.clamp(0, value.length);
+    var codeUnits = 0;
+    var bytes = 0;
+    for (final rune in value.runes) {
+      final character = String.fromCharCode(rune);
+      if (codeUnits + character.length > target) break;
+      codeUnits += character.length;
+      bytes += utf8.encode(character).length;
+    }
+    return bytes;
   }
 
   /// Check if the current target controller is still valid (mounted)
@@ -159,26 +204,28 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
   static const _enterKey = '_enter';
   static const _symbolsKey = '_symbols';
   static const _lettersKey = '_letters';
+  static const _cursorLeftKey = '_cursor_left';
+  static const _cursorRightKey = '_cursor_right';
 
   static const _letterLayout = [
     ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
     ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
     [_shiftKey, 'z', 'x', 'c', 'v', 'b', 'n', 'm', _backspaceKey],
-    [_symbolsKey, _spaceKey, _enterKey],
+    [_symbolsKey, _cursorLeftKey, _spaceKey, _cursorRightKey, _enterKey],
   ];
 
   static const _symbolLayout = [
     ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
     ['@', '#', r'$', '%', '&', '*', '-', '+', '(', ')'],
     [_shiftKey, '!', '"', "'", ':', ';', '/', '?', _backspaceKey],
-    [_lettersKey, _spaceKey, _enterKey],
+    [_lettersKey, _cursorLeftKey, _spaceKey, _cursorRightKey, _enterKey],
   ];
 
   static const _symbolLayoutAlt = [
     ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
     ['[', ']', '{', '}', '<', '>', '=', '_', '\\', '|'],
     [_shiftKey, '~', '`', '^', '.', ',', ':', ';', _backspaceKey],
-    [_lettersKey, _spaceKey, _enterKey],
+    [_lettersKey, _cursorLeftKey, _spaceKey, _cursorRightKey, _enterKey],
   ];
 
   _KeyboardTarget? _activeTarget;
@@ -253,20 +300,33 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
     final target = _activeTarget;
     if (target == null) return;
     if (!target.secureInput) {
-      final updated = controller.text + value;
+      final selection = controller.selection;
+      final start =
+          selection.isValid ? selection.start : controller.text.length;
+      final end = selection.isValid ? selection.end : controller.text.length;
+      final updated = controller.text.replaceRange(start, end, value);
       controller.value = TextEditingValue(
         text: updated,
-        selection: TextSelection.collapsed(offset: updated.length),
+        selection: TextSelection.collapsed(offset: start + value.length),
       );
       _emitChanged();
       return;
     }
     final input = SecureKeyboard._inputs[controller];
     if (input == null) return;
+    SecureKeyboard._captureSelection(controller, input);
     final encoded = utf8.encode(value);
-    if (input.length + encoded.length > SecureKeyboard._maxInputBytes) return;
-    input.bytes.setRange(input.length, input.length + encoded.length, encoded);
+    if (input.length + encoded.length > SecureKeyboard._maxInputBytes) {
+      encoded.fillRange(0, encoded.length, 0);
+      return;
+    }
+    for (var i = input.length - 1; i >= input.cursor; i--) {
+      input.bytes[i + encoded.length] = input.bytes[i];
+    }
+    input.bytes.setRange(input.cursor, input.cursor + encoded.length, encoded);
     input.length += encoded.length;
+    input.cursor += encoded.length;
+    encoded.fillRange(0, encoded.length, 0);
     SecureKeyboard._renderSecureInput(controller, input);
     _emitChanged();
   }
@@ -278,26 +338,106 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
     if (target == null) return;
     if (!target.secureInput) {
       final current = controller.text;
-      if (current.isEmpty) return;
-      final lastRuneLength = current.runes.last > 0xffff ? 2 : 1;
-      final updated = current.substring(0, current.length - lastRuneLength);
+      final selection = controller.selection;
+      final end = selection.isValid ? selection.end : current.length;
+      var start = selection.isValid ? selection.start : current.length;
+      if (start == end) {
+        if (start == 0) return;
+        start = _previousCodePointOffset(current, start);
+      }
+      final updated = current.replaceRange(start, end, '');
       controller.value = TextEditingValue(
         text: updated,
-        selection: TextSelection.collapsed(offset: updated.length),
+        selection: TextSelection.collapsed(offset: start),
       );
       _emitChanged();
       return;
     }
     final input = SecureKeyboard._inputs[controller];
-    if (input == null || input.length == 0) return;
+    if (input == null) return;
+    SecureKeyboard._captureSelection(controller, input);
+    if (input.cursor == 0) return;
     final oldLength = input.length;
-    input.length--;
-    while (input.length > 0 && (input.bytes[input.length] & 0xc0) == 0x80) {
-      input.length--;
+    final deletedEnd = input.cursor;
+    var deletedStart = deletedEnd - 1;
+    while (deletedStart > 0 && (input.bytes[deletedStart] & 0xc0) == 0x80) {
+      deletedStart--;
     }
+    final deletedLength = deletedEnd - deletedStart;
+    for (var i = deletedEnd; i < oldLength; i++) {
+      input.bytes[i - deletedLength] = input.bytes[i];
+    }
+    input.length -= deletedLength;
+    input.cursor = deletedStart;
     input.bytes.fillRange(input.length, oldLength, 0);
     SecureKeyboard._renderSecureInput(controller, input);
     _emitChanged();
+  }
+
+  int _previousCodePointOffset(String value, int offset) {
+    if (offset <= 0) return 0;
+    var result = offset - 1;
+    if (result > 0) {
+      final current = value.codeUnitAt(result);
+      final previous = value.codeUnitAt(result - 1);
+      if (current >= 0xdc00 &&
+          current <= 0xdfff &&
+          previous >= 0xd800 &&
+          previous <= 0xdbff) {
+        result--;
+      }
+    }
+    return result;
+  }
+
+  int _nextCodePointOffset(String value, int offset) {
+    if (offset >= value.length) return value.length;
+    final current = value.codeUnitAt(offset);
+    if (current >= 0xd800 && current <= 0xdbff && offset + 1 < value.length) {
+      final next = value.codeUnitAt(offset + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) return offset + 2;
+    }
+    return offset + 1;
+  }
+
+  void _moveCursor({required bool left}) {
+    final controller = _controller;
+    final target = _activeTarget;
+    if (controller == null || target == null) return;
+
+    if (!target.secureInput) {
+      final selection = controller.selection;
+      var offset =
+          selection.isValid ? selection.extentOffset : controller.text.length;
+      if (!selection.isCollapsed) {
+        offset = left ? selection.start : selection.end;
+      } else {
+        offset = left
+            ? _previousCodePointOffset(controller.text, offset)
+            : _nextCodePointOffset(controller.text, offset);
+      }
+      controller.selection = TextSelection.collapsed(offset: offset);
+      return;
+    }
+
+    final input = SecureKeyboard._inputs[controller];
+    if (input == null) return;
+    SecureKeyboard._captureSelection(controller, input);
+    if (left) {
+      if (input.cursor == 0) return;
+      input.cursor--;
+      while (input.cursor > 0 && (input.bytes[input.cursor] & 0xc0) == 0x80) {
+        input.cursor--;
+      }
+    } else {
+      if (input.cursor >= input.length) return;
+      input.cursor++;
+      while (input.cursor < input.length &&
+          (input.bytes[input.cursor] & 0xc0) == 0x80) {
+        input.cursor++;
+      }
+    }
+    SecureKeyboard._renderSecureInput(controller, input);
   }
 
   void _toggleShift() {
@@ -338,6 +478,10 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
     }
     if (key == _backspaceKey) {
       _backspace();
+      return;
+    }
+    if (key == _cursorLeftKey || key == _cursorRightKey) {
+      _moveCursor(left: key == _cursorLeftKey);
       return;
     }
     if (key == _spaceKey) {
@@ -456,7 +600,8 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
 
     Widget label;
     if (key == _shiftKey) {
-      label = Icon(Icons.keyboard_arrow_up, color: CyberpunkTheme.textPrimary);
+      label = const Icon(Icons.keyboard_arrow_up,
+          color: CyberpunkTheme.textPrimary);
     } else if (key == _spaceKey) {
       label = const Text('SPACE',
           style: TextStyle(color: CyberpunkTheme.textSecondary));
@@ -469,6 +614,12 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
     } else if (key == _lettersKey) {
       label = const Text('ABC',
           style: TextStyle(color: CyberpunkTheme.textPrimary));
+    } else if (key == _cursorLeftKey) {
+      label = const Icon(Icons.keyboard_arrow_left,
+          color: CyberpunkTheme.textPrimary, size: 22);
+    } else if (key == _cursorRightKey) {
+      label = const Icon(Icons.keyboard_arrow_right,
+          color: CyberpunkTheme.textPrimary, size: 22);
     } else {
       final display = !_symbols && _isLetterKey(key) && (_shift || _capsLock)
           ? key.toUpperCase()
@@ -551,6 +702,7 @@ class _SecureKeyboardSheetState extends State<SecureKeyboardSheet> {
 class _SecureInputBuffer {
   final Uint8List bytes = Uint8List(SecureKeyboard._maxInputBytes);
   int length = 0;
+  int cursor = 0;
   bool obscured = true;
 
   int get characterCount {
@@ -559,6 +711,25 @@ class _SecureInputBuffer {
       if ((bytes[i] & 0xc0) != 0x80) count++;
     }
     return count;
+  }
+
+  int get characterCountBeforeCursor {
+    var count = 0;
+    for (var i = 0; i < cursor; i++) {
+      if ((bytes[i] & 0xc0) != 0x80) count++;
+    }
+    return count;
+  }
+
+  int byteOffsetForCharacter(int characterOffset) {
+    if (characterOffset <= 0) return 0;
+    var count = 0;
+    for (var i = 0; i < length; i++) {
+      if ((bytes[i] & 0xc0) == 0x80) continue;
+      if (count == characterOffset) return i;
+      count++;
+    }
+    return length;
   }
 }
 

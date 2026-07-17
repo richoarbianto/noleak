@@ -36,8 +36,6 @@ void vault_generate_id(uint8_t id_out[VAULT_ID_LEN]);
 
 // Forward declarations
 static int read_index(int fd, const uint8_t mk[VAULT_KEY_LEN]);
-static int write_index_section(int fd, const uint8_t mk[VAULT_KEY_LEN],
-                               vault_entry_t *entries, uint32_t entry_count);
 static uint32_t calculate_crc32(const uint8_t *data, size_t len);
 static size_t header_total_size(const void *header);
 static int calculate_index_plaintext_size(const vault_entry_t *entries,
@@ -53,6 +51,7 @@ static int append_integrity_hash(int fd);
 static void fsync_parent_dir(const char *path);
 static int migrate_journal_to_v1(const char *path, size_t old_header_size,
                                  int has_integrity_hash);
+static int migrate_active_to_log(const char *path);
 extern int clone_entries(const vault_entry_t *source, uint32_t count,
                          vault_entry_t **dest_out);
 
@@ -74,10 +73,18 @@ typedef struct {
 
 #define HEADER_BASE_SIZE sizeof(vault_header_t)
 #define WRAPPED_MK_SIZE (VAULT_KEY_LEN + VAULT_TAG_LEN + VAULT_NONCE_LEN)
+#define WRAPPED_INDEX_KEY_SIZE WRAPPED_MK_SIZE
 #define VAULT_JOURNAL_MAGIC "VAULTJ1"
 #define VAULT_JOURNAL_SLOT_COUNT 2
 #define VAULT_INDEX_PAD_FLAG 0x80000000u
 #define VAULT_INDEX_COUNT_MASK 0x7FFFFFFFu
+#define VAULT_CONTAINER_V1 1u
+#define VAULT_CONTAINER_LOG 2u
+#define VAULT_CONTAINER_LOG_LEGACY 3u
+#define VAULT_LOG_MAGIC "VAULTL2"
+#define VAULT_LOG_VERSION 2u
+#define VAULT_LOG_SLOT_COUNT 2u
+#define VAULT_ROOT_TAG_LEN 16u
 
 #pragma pack(push, 1)
 typedef struct {
@@ -100,7 +107,63 @@ typedef struct {
   uint8_t wrapped_mk[WRAPPED_MK_SIZE];
   uint32_t crc;
 } vault_journal_slot_t;
+
+typedef struct {
+  char magic[VAULT_MAGIC_LEN];
+  uint32_t version;
+  uint32_t slot_size;
+  uint32_t slot_count;
+  uint32_t flags;
+  uint32_t crc;
+} vault_log_super_t;
+
+typedef struct {
+  uint64_t seq;
+  uint8_t vault_id[VAULT_ID_LEN];
+  uint8_t kdf_salt[VAULT_SALT_LEN];
+  uint32_t kdf_mem;
+  uint32_t kdf_iter;
+  uint32_t kdf_parallel;
+  uint32_t wrapped_mk_len;
+  uint8_t wrapped_mk[WRAPPED_MK_SIZE];
+  uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE];
+  uint64_t index_offset;
+  uint64_t index_length;
+  uint64_t committed_size;
+  uint8_t root_tag[VAULT_ROOT_TAG_LEN];
+  uint32_t crc;
+} vault_log_slot_t;
+
+// Compatibility layout used by the first VAULTL2 builds. Those builds
+// encrypted the index directly with the master key and therefore did not
+// store a wrapped per-commit index key in the root slot.
+typedef struct {
+  uint64_t seq;
+  uint8_t vault_id[VAULT_ID_LEN];
+  uint8_t kdf_salt[VAULT_SALT_LEN];
+  uint32_t kdf_mem;
+  uint32_t kdf_iter;
+  uint32_t kdf_parallel;
+  uint32_t wrapped_mk_len;
+  uint8_t wrapped_mk[WRAPPED_MK_SIZE];
+  uint64_t index_offset;
+  uint64_t index_length;
+  uint64_t committed_size;
+  uint8_t root_tag[VAULT_ROOT_TAG_LEN];
+  uint32_t crc;
+} vault_log_legacy_slot_t;
+
+typedef struct {
+  char domain[VAULT_MAGIC_LEN];
+  uint8_t vault_id[VAULT_ID_LEN];
+  uint64_t sequence;
+} vault_log_index_aad_t;
 #pragma pack(pop)
+
+_Static_assert(sizeof(vault_log_legacy_slot_t) == 172,
+               "Unexpected legacy VAULTL2 root size");
+_Static_assert(sizeof(vault_log_slot_t) == 244,
+               "Unexpected current VAULTL2 root size");
 
 static size_t header_total_size(const void *header_ptr) {
   const vault_header_t *header = (const vault_header_t *)header_ptr;
@@ -186,6 +249,240 @@ static int journal_select_slot(int fd, const vault_journal_super_t *super,
   return VAULT_OK;
 }
 
+static int read_all_at(int fd, void *buffer, size_t len, uint64_t offset) {
+  uint8_t *cursor = (uint8_t *)buffer;
+  while (len > 0) {
+    ssize_t n = pread(fd, cursor, len, (off_t)offset);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return VAULT_ERR_IO;
+    cursor += n;
+    len -= (size_t)n;
+    offset += (uint64_t)n;
+  }
+  return VAULT_OK;
+}
+
+static int write_all(int fd, const void *buffer, size_t len) {
+  const uint8_t *cursor = (const uint8_t *)buffer;
+  while (len > 0) {
+    ssize_t n = write(fd, cursor, len);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return VAULT_ERR_IO;
+    cursor += n;
+    len -= (size_t)n;
+  }
+  return VAULT_OK;
+}
+
+static int write_all_at(int fd, const void *buffer, size_t len,
+                        uint64_t offset) {
+  const uint8_t *cursor = (const uint8_t *)buffer;
+  while (len > 0) {
+    ssize_t n = pwrite(fd, cursor, len, (off_t)offset);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return VAULT_ERR_IO;
+    cursor += n;
+    len -= (size_t)n;
+    offset += (uint64_t)n;
+  }
+  return VAULT_OK;
+}
+
+static size_t log_header_size(void) {
+  return sizeof(vault_log_super_t) +
+         VAULT_LOG_SLOT_COUNT * sizeof(vault_log_slot_t);
+}
+
+static size_t log_legacy_header_size(void) {
+  return sizeof(vault_log_super_t) +
+         VAULT_LOG_SLOT_COUNT * sizeof(vault_log_legacy_slot_t);
+}
+
+static uint32_t log_super_crc(const vault_log_super_t *super) {
+  return calculate_crc32((const uint8_t *)super,
+                         offsetof(vault_log_super_t, crc));
+}
+
+static uint32_t log_slot_crc(const vault_log_slot_t *slot) {
+  return calculate_crc32((const uint8_t *)slot,
+                         offsetof(vault_log_slot_t, crc));
+}
+
+static uint32_t
+log_legacy_slot_crc(const vault_log_legacy_slot_t *slot) {
+  return calculate_crc32((const uint8_t *)slot,
+                         offsetof(vault_log_legacy_slot_t, crc));
+}
+
+static int log_set_root_tag(vault_log_slot_t *slot,
+                            const uint8_t master_key[VAULT_KEY_LEN]) {
+  if (crypto_generichash(slot->root_tag, sizeof(slot->root_tag),
+                         (const uint8_t *)slot,
+                         offsetof(vault_log_slot_t, root_tag), master_key,
+                         VAULT_KEY_LEN) != 0) {
+    return VAULT_ERR_CRYPTO;
+  }
+  return VAULT_OK;
+}
+
+static int log_root_tag_valid(const vault_log_slot_t *slot,
+                              const uint8_t master_key[VAULT_KEY_LEN]) {
+  uint8_t expected[VAULT_ROOT_TAG_LEN];
+  int result = crypto_generichash(
+      expected, sizeof(expected), (const uint8_t *)slot,
+      offsetof(vault_log_slot_t, root_tag), master_key, VAULT_KEY_LEN);
+  if (result != 0)
+    return 0;
+  result = sodium_memcmp(expected, slot->root_tag, sizeof(expected)) == 0;
+  vault_zeroize(expected, sizeof(expected));
+  return result;
+}
+
+static int log_legacy_root_tag_valid(
+    const vault_log_legacy_slot_t *slot,
+    const uint8_t master_key[VAULT_KEY_LEN]) {
+  uint8_t expected[VAULT_ROOT_TAG_LEN];
+  int result = crypto_generichash(
+      expected, sizeof(expected), (const uint8_t *)slot,
+      offsetof(vault_log_legacy_slot_t, root_tag), master_key, VAULT_KEY_LEN);
+  if (result != 0)
+    return 0;
+  result = sodium_memcmp(expected, slot->root_tag, sizeof(expected)) == 0;
+  vault_zeroize(expected, sizeof(expected));
+  return result;
+}
+
+static int log_read_super(int fd, vault_log_super_t *super) {
+  if (read_all_at(fd, super, sizeof(*super), 0) != VAULT_OK)
+    return VAULT_ERR_IO;
+  if (memcmp(super->magic, VAULT_LOG_MAGIC, VAULT_MAGIC_LEN) != 0 ||
+      super->version != VAULT_LOG_VERSION ||
+      super->slot_count != VAULT_LOG_SLOT_COUNT ||
+      (super->slot_size != sizeof(vault_log_slot_t) &&
+       super->slot_size != sizeof(vault_log_legacy_slot_t)) ||
+      super->crc != log_super_crc(super)) {
+    return VAULT_ERR_CORRUPTED;
+  }
+  return VAULT_OK;
+}
+
+static int log_read_slot(int fd, const vault_log_super_t *super,
+                         uint32_t slot_index, uint64_t file_size,
+                         vault_log_slot_t *slot) {
+  if (!super || !slot || slot_index >= super->slot_count)
+    return VAULT_ERR_INVALID_PARAM;
+  if (super->slot_size != sizeof(vault_log_slot_t))
+    return VAULT_ERR_CORRUPTED;
+
+  uint64_t slot_offset = sizeof(vault_log_super_t) +
+                         (uint64_t)slot_index * super->slot_size;
+  if (read_all_at(fd, slot, sizeof(*slot), slot_offset) != VAULT_OK)
+    return VAULT_ERR_IO;
+  if (slot->seq == 0)
+    return VAULT_ERR_NOT_FOUND;
+  if (slot->wrapped_mk_len != WRAPPED_MK_SIZE ||
+      slot->crc != log_slot_crc(slot) ||
+      !validate_kdf_params(slot->kdf_mem, slot->kdf_iter,
+                           slot->kdf_parallel) ||
+      slot->index_offset < log_header_size() ||
+      slot->index_length < VAULT_NONCE_LEN + sizeof(uint64_t) + VAULT_TAG_LEN ||
+      slot->index_offset > UINT64_MAX - slot->index_length ||
+      slot->committed_size != slot->index_offset + slot->index_length ||
+      slot->committed_size > file_size) {
+    return VAULT_ERR_CORRUPTED;
+  }
+  return VAULT_OK;
+}
+
+static int log_read_legacy_slot(int fd, const vault_log_super_t *super,
+                                uint32_t slot_index, uint64_t file_size,
+                                vault_log_legacy_slot_t *slot) {
+  if (!super || !slot || slot_index >= super->slot_count)
+    return VAULT_ERR_INVALID_PARAM;
+  if (super->slot_size != sizeof(vault_log_legacy_slot_t))
+    return VAULT_ERR_CORRUPTED;
+
+  uint64_t slot_offset = sizeof(vault_log_super_t) +
+                         (uint64_t)slot_index * super->slot_size;
+  if (read_all_at(fd, slot, sizeof(*slot), slot_offset) != VAULT_OK)
+    return VAULT_ERR_IO;
+  if (slot->seq == 0)
+    return VAULT_ERR_NOT_FOUND;
+  if (slot->wrapped_mk_len != WRAPPED_MK_SIZE ||
+      slot->crc != log_legacy_slot_crc(slot) ||
+      !validate_kdf_params(slot->kdf_mem, slot->kdf_iter,
+                           slot->kdf_parallel) ||
+      slot->index_offset < log_legacy_header_size() ||
+      slot->index_length < VAULT_NONCE_LEN + sizeof(uint64_t) + VAULT_TAG_LEN ||
+      slot->index_offset > UINT64_MAX - slot->index_length ||
+      slot->committed_size != slot->index_offset + slot->index_length ||
+      slot->committed_size > file_size) {
+    return VAULT_ERR_CORRUPTED;
+  }
+  return VAULT_OK;
+}
+
+static int log_select_slot(int fd, const vault_log_super_t *super,
+                           uint64_t file_size, vault_log_slot_t *slot_out,
+                           uint32_t *slot_index_out) {
+  int found = 0;
+  vault_log_slot_t best;
+  uint32_t best_index = 0;
+  memset(&best, 0, sizeof(best));
+
+  for (uint32_t i = 0; i < super->slot_count; i++) {
+    vault_log_slot_t candidate;
+    if (log_read_slot(fd, super, i, file_size, &candidate) != VAULT_OK)
+      continue;
+    if (!found || candidate.seq > best.seq) {
+      found = 1;
+      best = candidate;
+      best_index = i;
+    }
+  }
+
+  if (!found)
+    return VAULT_ERR_CORRUPTED;
+  *slot_out = best;
+  if (slot_index_out)
+    *slot_index_out = best_index;
+  return VAULT_OK;
+}
+
+static int log_select_legacy_slot(int fd, const vault_log_super_t *super,
+                                  uint64_t file_size,
+                                  vault_log_legacy_slot_t *slot_out,
+                                  uint32_t *slot_index_out) {
+  int found = 0;
+  vault_log_legacy_slot_t best;
+  uint32_t best_index = 0;
+  memset(&best, 0, sizeof(best));
+
+  for (uint32_t i = 0; i < super->slot_count; i++) {
+    vault_log_legacy_slot_t candidate;
+    if (log_read_legacy_slot(fd, super, i, file_size, &candidate) != VAULT_OK)
+      continue;
+    if (!found || candidate.seq > best.seq) {
+      found = 1;
+      best = candidate;
+      best_index = i;
+    }
+  }
+
+  if (!found)
+    return VAULT_ERR_CORRUPTED;
+  *slot_out = best;
+  if (slot_index_out)
+    *slot_index_out = best_index;
+  return VAULT_OK;
+}
+
 static int validate_kdf_params(uint32_t mem_limit, uint32_t iterations,
                                uint32_t parallel) {
   return vault_kdf_params_valid(mem_limit, iterations, parallel);
@@ -205,13 +502,42 @@ int vault_inspect_kdf_params(const char *path, uint32_t *mem_out,
   uint32_t iterations = 0;
   uint32_t parallelism = 0;
   uint8_t magic[VAULT_MAGIC_LEN];
+  struct stat st;
+
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
 
   if (pread(fd, magic, sizeof(magic), 0) != sizeof(magic)) {
     result = VAULT_ERR_IO;
     goto cleanup;
   }
 
-  if (memcmp(magic, VAULT_JOURNAL_MAGIC, VAULT_MAGIC_LEN) == 0) {
+  if (memcmp(magic, VAULT_LOG_MAGIC, VAULT_MAGIC_LEN) == 0) {
+    vault_log_super_t super;
+    result = log_read_super(fd, &super);
+    if (result != VAULT_OK)
+      goto cleanup;
+    if (super.slot_size == sizeof(vault_log_legacy_slot_t)) {
+      vault_log_legacy_slot_t slot;
+      result = log_select_legacy_slot(fd, &super, (uint64_t)st.st_size, &slot,
+                                      NULL);
+      if (result != VAULT_OK)
+        goto cleanup;
+      memory = slot.kdf_mem;
+      iterations = slot.kdf_iter;
+      parallelism = slot.kdf_parallel;
+    } else {
+      vault_log_slot_t slot;
+      result = log_select_slot(fd, &super, (uint64_t)st.st_size, &slot, NULL);
+      if (result != VAULT_OK)
+        goto cleanup;
+      memory = slot.kdf_mem;
+      iterations = slot.kdf_iter;
+      parallelism = slot.kdf_parallel;
+    }
+  } else if (memcmp(magic, VAULT_JOURNAL_MAGIC, VAULT_MAGIC_LEN) == 0) {
     vault_journal_super_t super;
     vault_journal_slot_t slot;
     result = journal_read_super(fd, &super);
@@ -284,6 +610,18 @@ static void fsync_parent_dir(const char *path) {
     close(dir_fd);
   }
   free(copy);
+}
+
+static void remove_stale_temp_file(const char *path) {
+  if (!path)
+    return;
+  size_t path_len = strlen(path);
+  char *temp_path = malloc(path_len + 5);
+  if (!temp_path)
+    return;
+  snprintf(temp_path, path_len + 5, "%s.tmp", path);
+  unlink(temp_path);
+  free(temp_path);
 }
 
 static int append_integrity_hash(int fd) {
@@ -634,6 +972,281 @@ static int deserialize_index(const uint8_t *data, size_t len,
   return VAULT_OK;
 }
 
+static void log_index_aad_init(vault_log_index_aad_t *aad,
+                               const uint8_t vault_id[VAULT_ID_LEN],
+                               uint64_t sequence) {
+  memset(aad, 0, sizeof(*aad));
+  memcpy(aad->domain, "IDXLOG2", VAULT_MAGIC_LEN);
+  memcpy(aad->vault_id, vault_id, VAULT_ID_LEN);
+  aad->sequence = sequence;
+}
+
+static void log_index_key_aad_init(vault_log_index_aad_t *aad,
+                                   const uint8_t vault_id[VAULT_ID_LEN],
+                                   uint64_t sequence) {
+  memset(aad, 0, sizeof(*aad));
+  memcpy(aad->domain, "IDXKEY2", VAULT_MAGIC_LEN);
+  memcpy(aad->vault_id, vault_id, VAULT_ID_LEN);
+  aad->sequence = sequence;
+}
+
+static int log_wrap_index_key(
+    const uint8_t master_key[VAULT_KEY_LEN],
+    const uint8_t vault_id[VAULT_ID_LEN], uint64_t sequence,
+    const uint8_t index_key[VAULT_KEY_LEN],
+    uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE]) {
+  vault_log_index_aad_t aad;
+  log_index_key_aad_init(&aad, vault_id, sequence);
+  return vault_aead_encrypt(
+      master_key, NULL, (const uint8_t *)&aad, sizeof(aad), index_key,
+      VAULT_KEY_LEN, wrapped_index_key + VAULT_NONCE_LEN, wrapped_index_key);
+}
+
+static int log_unwrap_index_key(
+    const uint8_t master_key[VAULT_KEY_LEN],
+    const uint8_t vault_id[VAULT_ID_LEN], uint64_t sequence,
+    const uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE],
+    uint8_t index_key[VAULT_KEY_LEN]) {
+  vault_log_index_aad_t aad;
+  log_index_key_aad_init(&aad, vault_id, sequence);
+  size_t index_key_len = 0;
+  int result = vault_aead_decrypt(
+      master_key, wrapped_index_key, (const uint8_t *)&aad, sizeof(aad),
+      wrapped_index_key + VAULT_NONCE_LEN, VAULT_KEY_LEN + VAULT_TAG_LEN,
+      index_key, &index_key_len);
+  if (result != VAULT_OK || index_key_len != VAULT_KEY_LEN) {
+    vault_zeroize(index_key, VAULT_KEY_LEN);
+    return result == VAULT_OK ? VAULT_ERR_CORRUPTED : result;
+  }
+  return VAULT_OK;
+}
+
+static int build_log_index_record(const vault_entry_t *entries,
+                                  uint32_t count,
+                                  const uint8_t index_key[VAULT_KEY_LEN],
+                                  const uint8_t vault_id[VAULT_ID_LEN],
+                                  uint64_t sequence, uint8_t **record_out,
+                                  size_t *record_len_out) {
+  uint8_t *plaintext = NULL;
+  uint8_t *record = NULL;
+  size_t plaintext_len = 0;
+  int result = serialize_index(entries, count, &plaintext, &plaintext_len);
+  if (result != VAULT_OK)
+    return result;
+
+  size_t ciphertext_len = plaintext_len + VAULT_TAG_LEN;
+  size_t record_len = VAULT_NONCE_LEN + sizeof(uint64_t) + ciphertext_len;
+  record = malloc(record_len);
+  if (!record) {
+    result = VAULT_ERR_MEMORY;
+    goto cleanup;
+  }
+
+  uint64_t ciphertext_len_u64 = ciphertext_len;
+  memcpy(record + VAULT_NONCE_LEN, &ciphertext_len_u64,
+         sizeof(ciphertext_len_u64));
+
+  vault_log_index_aad_t aad;
+  log_index_aad_init(&aad, vault_id, sequence);
+  result = vault_aead_encrypt(
+      index_key, NULL, (const uint8_t *)&aad, sizeof(aad), plaintext,
+      plaintext_len, record + VAULT_NONCE_LEN + sizeof(uint64_t), record);
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  *record_out = record;
+  *record_len_out = record_len;
+  record = NULL;
+
+cleanup:
+  if (plaintext) {
+    vault_zeroize(plaintext, plaintext_len);
+    free(plaintext);
+  }
+  if (record) {
+    vault_zeroize(record, record_len);
+    free(record);
+  }
+  return result;
+}
+
+static int read_log_index(int fd, const vault_log_slot_t *slot,
+                          const uint8_t index_key[VAULT_KEY_LEN]) {
+  if (!slot || slot->index_length > 100 * 1024 * 1024 +
+                                        VAULT_NONCE_LEN + sizeof(uint64_t) +
+                                        VAULT_TAG_LEN) {
+    return VAULT_ERR_CORRUPTED;
+  }
+
+  size_t record_len = (size_t)slot->index_length;
+  uint8_t *record = malloc(record_len);
+  if (!record)
+    return VAULT_ERR_MEMORY;
+
+  int result = read_all_at(fd, record, record_len, slot->index_offset);
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  uint64_t ciphertext_len = 0;
+  memcpy(&ciphertext_len, record + VAULT_NONCE_LEN, sizeof(ciphertext_len));
+  if (ciphertext_len < VAULT_TAG_LEN ||
+      ciphertext_len !=
+          record_len - VAULT_NONCE_LEN - sizeof(uint64_t)) {
+    result = VAULT_ERR_CORRUPTED;
+    goto cleanup;
+  }
+
+  size_t plaintext_len = (size_t)ciphertext_len - VAULT_TAG_LEN;
+  uint8_t *plaintext = malloc(plaintext_len);
+  if (!plaintext) {
+    result = VAULT_ERR_MEMORY;
+    goto cleanup;
+  }
+
+  vault_log_index_aad_t aad;
+  log_index_aad_init(&aad, slot->vault_id, slot->seq);
+  size_t actual_len = 0;
+  result = vault_aead_decrypt(
+      index_key, record, (const uint8_t *)&aad, sizeof(aad),
+      record + VAULT_NONCE_LEN + sizeof(uint64_t), (size_t)ciphertext_len,
+      plaintext, &actual_len);
+  if (result == VAULT_OK) {
+    vault_entry_t *entries = NULL;
+    uint32_t count = 0;
+    result = deserialize_index(plaintext, actual_len, &entries, &count);
+    if (result == VAULT_OK) {
+      if (g_vault.entries)
+        free_entries_array(g_vault.entries, g_vault.entry_count);
+      g_vault.entries = entries;
+      g_vault.entry_count = count;
+    }
+  }
+
+  vault_zeroize(plaintext, plaintext_len);
+  free(plaintext);
+
+cleanup:
+  vault_zeroize(record, record_len);
+  free(record);
+  return result;
+}
+
+static void log_init_super(vault_log_super_t *super) {
+  memset(super, 0, sizeof(*super));
+  memcpy(super->magic, VAULT_LOG_MAGIC, VAULT_MAGIC_LEN);
+  super->version = VAULT_LOG_VERSION;
+  super->slot_size = sizeof(vault_log_slot_t);
+  super->slot_count = VAULT_LOG_SLOT_COUNT;
+  super->crc = log_super_crc(super);
+}
+
+static int log_fill_slot(vault_log_slot_t *slot, uint64_t sequence,
+                         const uint8_t vault_id[VAULT_ID_LEN],
+                         const uint8_t salt[VAULT_SALT_LEN], uint32_t kdf_mem,
+                         uint32_t kdf_iter, uint32_t kdf_parallel,
+                         const uint8_t wrapped_mk[WRAPPED_MK_SIZE],
+                         const uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE],
+                         uint64_t index_offset, uint64_t index_length,
+                         uint64_t committed_size,
+                         const uint8_t master_key[VAULT_KEY_LEN]) {
+  memset(slot, 0, sizeof(*slot));
+  slot->seq = sequence;
+  memcpy(slot->vault_id, vault_id, VAULT_ID_LEN);
+  memcpy(slot->kdf_salt, salt, VAULT_SALT_LEN);
+  slot->kdf_mem = kdf_mem;
+  slot->kdf_iter = kdf_iter;
+  slot->kdf_parallel = kdf_parallel;
+  slot->wrapped_mk_len = WRAPPED_MK_SIZE;
+  memcpy(slot->wrapped_mk, wrapped_mk, WRAPPED_MK_SIZE);
+  memcpy(slot->wrapped_index_key, wrapped_index_key,
+         WRAPPED_INDEX_KEY_SIZE);
+  slot->index_offset = index_offset;
+  slot->index_length = index_length;
+  slot->committed_size = committed_size;
+  int result = log_set_root_tag(slot, master_key);
+  if (result != VAULT_OK)
+    return result;
+  slot->crc = log_slot_crc(slot);
+  return VAULT_OK;
+}
+
+static int log_write_slot(int fd, uint32_t slot_index,
+                          const vault_log_slot_t *slot) {
+  if (slot_index >= VAULT_LOG_SLOT_COUNT)
+    return VAULT_ERR_INVALID_PARAM;
+  uint64_t offset = sizeof(vault_log_super_t) +
+                    (uint64_t)slot_index * sizeof(vault_log_slot_t);
+  return write_all_at(fd, slot, sizeof(*slot), offset);
+}
+
+static int log_validate_entry_ranges(const vault_log_slot_t *slot,
+                                     size_t minimum_data_offset) {
+  for (uint32_t i = 0; i < g_vault.entry_count; i++) {
+    const vault_entry_t *entry = &g_vault.entries[i];
+    if (entry->chunk_count > 0) {
+      for (uint32_t c = 0; c < entry->chunk_count; c++) {
+        uint64_t offset = entry->chunks[c].offset;
+        uint64_t length = entry->chunks[c].length;
+        if (length < VAULT_TAG_LEN || offset < minimum_data_offset ||
+            offset > UINT64_MAX - length ||
+            offset + length > slot->index_offset) {
+          return VAULT_ERR_CORRUPTED;
+        }
+      }
+    } else {
+      uint64_t offset = entry->data_offset;
+      uint64_t length = entry->data_length;
+      if (length < VAULT_NONCE_LEN + VAULT_TAG_LEN ||
+          offset < minimum_data_offset || offset > UINT64_MAX - length ||
+          offset + length > slot->index_offset) {
+        return VAULT_ERR_CORRUPTED;
+      }
+    }
+  }
+  return VAULT_OK;
+}
+
+static void log_refresh_metrics(void) {
+  uint64_t used = log_header_size() + g_vault.index_length;
+  for (uint32_t i = 0; i < g_vault.entry_count; i++) {
+    const vault_entry_t *entry = &g_vault.entries[i];
+    if (entry->chunk_count > 0) {
+      for (uint32_t c = 0; c < entry->chunk_count; c++)
+        used += entry->chunks[c].length;
+    } else {
+      used += entry->data_length;
+    }
+  }
+  g_vault.total_size = g_vault.committed_size;
+  g_vault.free_space =
+      g_vault.committed_size > used ? g_vault.committed_size - used : 0;
+}
+
+static void legacy_refresh_metrics(const char *path) {
+  struct stat st;
+  if (!path || stat(path, &st) != 0)
+    return;
+  g_vault.total_size = st.st_size > 0 ? (uint64_t)st.st_size : 0;
+  uint64_t max_offset = 0;
+  for (uint32_t i = 0; i < g_vault.entry_count; i++) {
+    const vault_entry_t *entry = &g_vault.entries[i];
+    if (entry->chunk_count > 0) {
+      for (uint32_t c = 0; c < entry->chunk_count; c++) {
+        uint64_t end = entry->chunks[c].offset + entry->chunks[c].length;
+        if (end > max_offset)
+          max_offset = end;
+      }
+    } else {
+      uint64_t end = entry->data_offset + entry->data_length;
+      if (end > max_offset)
+        max_offset = end;
+    }
+  }
+  g_vault.free_space = g_vault.total_size > max_offset
+                           ? g_vault.total_size - max_offset
+                           : 0;
+}
+
 static void free_entries_array(vault_entry_t *entries, uint32_t count) {
   if (!entries)
     return;
@@ -644,234 +1257,336 @@ static void free_entries_array(vault_entry_t *entries, uint32_t count) {
 }
 
 int vault_create(const char *path, const uint8_t *passphrase, size_t pass_len) {
-  if (!path || !passphrase) {
+  if (!path || !passphrase)
     return VAULT_ERR_INVALID_PARAM;
-  }
 
-  // Ensure vault engine is initialized
-  // This is critical - without sodium_init(), all crypto ops will fail
-  LOGI("vault_create: Starting for path=%s", path);
-  int init_result = vault_init();
-  if (init_result != VAULT_OK) {
-    LOGE("Vault engine not initialized, result=%d", init_result);
-    return init_result;
-  }
-  LOGI("vault_create: Engine initialized");
-
-  if (pass_len < VAULT_MIN_PASSPHRASE_LEN) {
-    LOGE("Passphrase too short: %zu < %d", pass_len, VAULT_MIN_PASSPHRASE_LEN);
+  int result = vault_init();
+  if (result != VAULT_OK)
+    return result;
+  if (pass_len < VAULT_MIN_PASSPHRASE_LEN)
     return VAULT_ERR_PASSPHRASE_TOO_SHORT;
-  }
 
-  // Check if file already exists
-  if (access(path, F_OK) == 0) {
-    LOGE("Vault already exists at %s", path);
+  remove_stale_temp_file(path);
+  if (access(path, F_OK) == 0)
     return VAULT_ERR_ALREADY_EXISTS;
-  }
-  LOGI("vault_create: Path is available");
 
-  // Ensure parent directory exists
   char *path_copy = strdup(path);
-  if (path_copy) {
-    char *last_slash = strrchr(path_copy, '/');
-    if (last_slash) {
-      *last_slash = '\0';
-      // Create directory with parents if needed (mode 0700 for security)
-      struct stat st;
-      if (stat(path_copy, &st) != 0) {
-        // Directory doesn't exist, create it
-        LOGI("vault_create: Creating directory %s", path_copy);
-        if (mkdir(path_copy, 0700) != 0 && errno != EEXIST) {
-          LOGE("Failed to create directory: %s (errno=%d)", path_copy, errno);
-          free(path_copy);
-          return VAULT_ERR_IO;
-        }
-      } else {
-        LOGI("vault_create: Directory exists");
-      }
+  if (!path_copy)
+    return VAULT_ERR_MEMORY;
+  char *last_slash = strrchr(path_copy, '/');
+  if (last_slash) {
+    *last_slash = '\0';
+    struct stat directory;
+    if (stat(path_copy, &directory) != 0 &&
+        mkdir(path_copy, 0700) != 0 && errno != EEXIST) {
+      free(path_copy);
+      return VAULT_ERR_IO;
     }
-    free(path_copy);
   }
+  free(path_copy);
 
-  int result = VAULT_OK;
   int fd = -1;
   char *temp_path = NULL;
   uint8_t salt[VAULT_SALT_LEN];
   uint8_t kek[VAULT_KEY_LEN];
-  uint8_t mk[VAULT_KEY_LEN];
+  uint8_t master_key[VAULT_KEY_LEN];
   uint8_t wrapped_mk[WRAPPED_MK_SIZE];
+  uint8_t index_key[VAULT_KEY_LEN];
+  uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE];
   uint8_t nonce[VAULT_NONCE_LEN];
   uint8_t vault_id[VAULT_ID_LEN];
+  uint8_t *index_record = NULL;
+  size_t index_record_len = 0;
+  memset(kek, 0, sizeof(kek));
+  memset(master_key, 0, sizeof(master_key));
+  memset(wrapped_mk, 0, sizeof(wrapped_mk));
+  memset(index_key, 0, sizeof(index_key));
+  memset(wrapped_index_key, 0, sizeof(wrapped_index_key));
 
-  // Generate random values
-  LOGI("vault_create: Generating random values");
-  vault_random_bytes(salt, VAULT_SALT_LEN);
-  vault_random_bytes(mk, VAULT_KEY_LEN);
+  vault_random_bytes(salt, sizeof(salt));
+  vault_random_bytes(master_key, sizeof(master_key));
   vault_generate_id(vault_id);
 
-  // Derive KEK from passphrase
-  LOGI("vault_create: Deriving KEK (this may take a while)");
   result = vault_kdf_derive(passphrase, pass_len, salt, kek);
-  if (result != VAULT_OK) {
-    LOGE("vault_create: KDF failed with result=%d", result);
+  if (result != VAULT_OK)
     goto cleanup;
-  }
-  LOGI("vault_create: KEK derived successfully");
 
-  // Wrap MK with KEK
-  // wrapped_mk = nonce || ciphertext || tag
-  vault_random_bytes(nonce, VAULT_NONCE_LEN);
-  memcpy(wrapped_mk, nonce, VAULT_NONCE_LEN);
-
+  vault_random_bytes(nonce, sizeof(nonce));
+  memcpy(wrapped_mk, nonce, sizeof(nonce));
   result = vault_aead_encrypt(
-      kek, nonce, vault_id, VAULT_ID_LEN, // AAD = vault_id
-      mk, VAULT_KEY_LEN, wrapped_mk + VAULT_NONCE_LEN, nonce);
-  if (result != VAULT_OK) {
-    LOGE("vault_create: AEAD encrypt failed with result=%d", result);
+      kek, nonce, vault_id, VAULT_ID_LEN, master_key, VAULT_KEY_LEN,
+      wrapped_mk + VAULT_NONCE_LEN, nonce);
+  if (result != VAULT_OK)
     goto cleanup;
-  }
-  LOGI("vault_create: MK wrapped successfully");
 
-  // Create temp file for atomic write
+  size_t kdf_mem_size = 0;
+  uint32_t kdf_iter = 0;
+  uint32_t kdf_parallel = 0;
+  vault_get_kdf_params(&kdf_mem_size, &kdf_iter, &kdf_parallel);
+  uint32_t kdf_mem = (uint32_t)kdf_mem_size;
+
   size_t path_len = strlen(path);
   temp_path = malloc(path_len + 5);
   if (!temp_path) {
-    LOGE("vault_create: Failed to allocate temp_path");
     result = VAULT_ERR_MEMORY;
     goto cleanup;
   }
   snprintf(temp_path, path_len + 5, "%s.tmp", path);
-
-  LOGI("vault_create: Creating temp file %s", temp_path);
   fd = open(temp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
   if (fd < 0) {
-    LOGE("Failed to create temp file: %s (errno=%d)", temp_path, errno);
-    result = VAULT_ERR_IO;
-    goto cleanup;
-  }
-  LOGI("vault_create: Temp file created, fd=%d", fd);
-
-  // Write header
-  vault_header_t header;
-  memset(&header, 0, sizeof(header));
-  memcpy(header.magic, VAULT_MAGIC, VAULT_MAGIC_LEN);
-  header.version = VAULT_VERSION;
-  memcpy(header.vault_id, vault_id, VAULT_ID_LEN);
-  memcpy(header.kdf_salt, salt, VAULT_SALT_LEN);
-  // Use adaptive KDF params based on device capability
-  size_t kdf_mem;
-  uint32_t kdf_iter, kdf_parallel;
-  vault_get_kdf_params(&kdf_mem, &kdf_iter, &kdf_parallel);
-  header.kdf_mem = (uint32_t)kdf_mem;
-  header.kdf_iter = kdf_iter;
-  header.kdf_parallel = kdf_parallel;
-  header.wrapped_mk_len = WRAPPED_MK_SIZE;
-
-  LOGI("vault_create: Writing header (%zu bytes)", sizeof(header));
-  if (write(fd, &header, sizeof(header)) != sizeof(header)) {
-    LOGE("vault_create: Failed to write header (errno=%d)", errno);
     result = VAULT_ERR_IO;
     goto cleanup;
   }
 
-  LOGI("vault_create: Writing wrapped_mk (%d bytes)", WRAPPED_MK_SIZE);
-  if (write(fd, wrapped_mk, WRAPPED_MK_SIZE) != WRAPPED_MK_SIZE) {
-    LOGE("vault_create: Failed to write wrapped_mk (errno=%d)", errno);
+  vault_log_super_t super;
+  log_init_super(&super);
+  vault_log_slot_t empty_slots[VAULT_LOG_SLOT_COUNT];
+  memset(empty_slots, 0, sizeof(empty_slots));
+  result = write_all(fd, &super, sizeof(super));
+  if (result == VAULT_OK)
+    result = write_all(fd, empty_slots, sizeof(empty_slots));
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  const uint64_t sequence = 1;
+  vault_random_bytes(index_key, sizeof(index_key));
+  result = log_wrap_index_key(master_key, vault_id, sequence, index_key,
+                              wrapped_index_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = build_log_index_record(NULL, 0, index_key, vault_id, sequence,
+                                  &index_record, &index_record_len);
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  uint64_t index_offset = log_header_size();
+  result = write_all(fd, index_record, index_record_len);
+  if (result != VAULT_OK || fsync(fd) != 0) {
     result = VAULT_ERR_IO;
     goto cleanup;
   }
 
-  // Write header CRC
-  uint32_t crc = calculate_crc32((uint8_t *)&header, sizeof(header));
-  LOGI("vault_create: Writing CRC");
-  if (write(fd, &crc, sizeof(crc)) != sizeof(crc)) {
-    LOGE("vault_create: Failed to write CRC (errno=%d)", errno);
+  uint64_t committed_size = index_offset + index_record_len;
+  vault_log_slot_t root;
+  result = log_fill_slot(&root, sequence, vault_id, salt, kdf_mem, kdf_iter,
+                         kdf_parallel, wrapped_mk, wrapped_index_key,
+                         index_offset,
+                         index_record_len, committed_size, master_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = log_write_slot(fd, 0, &root);
+  if (result == VAULT_OK)
+    result = log_write_slot(fd, 1, &root);
+  if (result != VAULT_OK || fsync(fd) != 0) {
     result = VAULT_ERR_IO;
     goto cleanup;
   }
 
-  // Write empty encrypted index
-  LOGI("vault_create: Writing index section");
-  result = write_index_section(fd, mk, NULL, 0);
-  if (result != VAULT_OK) {
-    LOGE("vault_create: Failed to write index section, result=%d", result);
-    goto cleanup;
-  }
-  LOGI("vault_create: Index section written");
-
-  // Compute and append SHA256 integrity hash
-  {
-    LOGI("vault_create: Computing integrity hash");
-    fsync(fd);
-
-    off_t current_pos = lseek(fd, 0, SEEK_CUR);
-    if (current_pos < 0) {
-      LOGE("vault_create: lseek failed (errno=%d)", errno);
-      result = VAULT_ERR_IO;
-      goto cleanup;
-    }
-
-    lseek(fd, 0, SEEK_SET);
-
-    crypto_hash_sha256_state hash_state;
-    crypto_hash_sha256_init(&hash_state);
-
-    uint8_t hash_buffer[64 * 1024];
-    uint64_t remaining = (uint64_t)current_pos;
-
-    while (remaining > 0) {
-      size_t to_read = remaining > sizeof(hash_buffer)
-                           ? sizeof(hash_buffer)
-                           : (size_t)remaining;
-      ssize_t read_len = read(fd, hash_buffer, to_read);
-      if (read_len <= 0) {
-        result = VAULT_ERR_IO;
-        goto cleanup;
-      }
-      crypto_hash_sha256_update(&hash_state, hash_buffer, read_len);
-      remaining -= read_len;
-    }
-
-    uint8_t file_hash[VAULT_HASH_LEN];
-    crypto_hash_sha256_final(&hash_state, file_hash);
-
-    lseek(fd, 0, SEEK_END);
-    if (write(fd, file_hash, VAULT_HASH_LEN) != VAULT_HASH_LEN) {
-      result = VAULT_ERR_IO;
-      goto cleanup;
-    }
-
-    LOGI("Container integrity hash appended (SHA256)");
-  }
-
-  // Sync and close
-  fsync(fd);
   close(fd);
   fd = -1;
-
-  // Atomic rename
   if (rename(temp_path, path) != 0) {
-    LOGE("Failed to rename temp file");
     result = VAULT_ERR_IO;
     goto cleanup;
   }
   fsync_parent_dir(path);
-
-  LOGI("Vault created successfully at %s", path);
+  result = VAULT_OK;
 
 cleanup:
-  vault_zeroize(kek, VAULT_KEY_LEN);
-  vault_zeroize(mk, VAULT_KEY_LEN);
-  vault_zeroize(wrapped_mk, WRAPPED_MK_SIZE);
-
-  if (fd >= 0) {
+  vault_zeroize(kek, sizeof(kek));
+  vault_zeroize(master_key, sizeof(master_key));
+  vault_zeroize(wrapped_mk, sizeof(wrapped_mk));
+  vault_zeroize(index_key, sizeof(index_key));
+  vault_zeroize(wrapped_index_key, sizeof(wrapped_index_key));
+  if (index_record) {
+    vault_zeroize(index_record, index_record_len);
+    free(index_record);
+  }
+  if (fd >= 0)
     close(fd);
+  if (result != VAULT_OK && temp_path)
+    unlink(temp_path);
+  free(temp_path);
+  return result;
+}
+
+static int open_log_container(int fd, uint64_t file_size, const char *path,
+                              const uint8_t *passphrase, size_t pass_len) {
+  vault_log_super_t super;
+  vault_log_slot_t slot;
+  uint32_t slot_index = 0;
+  uint8_t kek[VAULT_KEY_LEN];
+  uint8_t index_key[VAULT_KEY_LEN];
+  memset(kek, 0, sizeof(kek));
+  memset(index_key, 0, sizeof(index_key));
+
+  int result = log_read_super(fd, &super);
+  if (result != VAULT_OK)
+    goto cleanup;
+  if (super.slot_size == sizeof(vault_log_legacy_slot_t)) {
+    vault_log_legacy_slot_t legacy_slot;
+    result = log_select_legacy_slot(fd, &super, file_size, &legacy_slot,
+                                    &slot_index);
+    if (result != VAULT_OK)
+      goto cleanup;
+
+    result = vault_kdf_derive_with_params(
+        passphrase, pass_len, legacy_slot.kdf_salt, legacy_slot.kdf_mem,
+        legacy_slot.kdf_iter, kek);
+    if (result != VAULT_OK)
+      goto cleanup;
+
+    size_t master_key_len = 0;
+    result = vault_aead_decrypt(
+        kek, legacy_slot.wrapped_mk, legacy_slot.vault_id, VAULT_ID_LEN,
+        legacy_slot.wrapped_mk + VAULT_NONCE_LEN,
+        VAULT_KEY_LEN + VAULT_TAG_LEN, g_vault.master_key, &master_key_len);
+    if (result != VAULT_OK || master_key_len != VAULT_KEY_LEN) {
+      result = VAULT_ERR_AUTH_FAIL;
+      goto cleanup;
+    }
+    if (!log_legacy_root_tag_valid(&legacy_slot, g_vault.master_key)) {
+      result = VAULT_ERR_CORRUPTED;
+      goto cleanup;
+    }
+
+    memset(&slot, 0, sizeof(slot));
+    slot.seq = legacy_slot.seq;
+    memcpy(slot.vault_id, legacy_slot.vault_id, VAULT_ID_LEN);
+    memcpy(slot.kdf_salt, legacy_slot.kdf_salt, VAULT_SALT_LEN);
+    slot.kdf_mem = legacy_slot.kdf_mem;
+    slot.kdf_iter = legacy_slot.kdf_iter;
+    slot.kdf_parallel = legacy_slot.kdf_parallel;
+    slot.wrapped_mk_len = legacy_slot.wrapped_mk_len;
+    memcpy(slot.wrapped_mk, legacy_slot.wrapped_mk, WRAPPED_MK_SIZE);
+    slot.index_offset = legacy_slot.index_offset;
+    slot.index_length = legacy_slot.index_length;
+    slot.committed_size = legacy_slot.committed_size;
+
+    memcpy(g_vault.vault_id, slot.vault_id, VAULT_ID_LEN);
+    memcpy(g_vault.salt, slot.kdf_salt, VAULT_SALT_LEN);
+    memcpy(g_vault.wrapped_mk, slot.wrapped_mk, WRAPPED_MK_SIZE);
+    g_vault.wrapped_mk_len = WRAPPED_MK_SIZE;
+    g_vault.kdf_mem = slot.kdf_mem;
+    g_vault.kdf_iter = slot.kdf_iter;
+    g_vault.kdf_parallel = slot.kdf_parallel;
+    g_vault.container_format = VAULT_CONTAINER_LOG_LEGACY;
+    g_vault.commit_sequence = slot.seq;
+    g_vault.committed_size = slot.committed_size;
+    g_vault.index_offset = slot.index_offset;
+    g_vault.index_length = slot.index_length;
+    g_vault.active_root_slot = slot_index;
+    g_vault.path = strdup(path);
+    if (!g_vault.path) {
+      result = VAULT_ERR_MEMORY;
+      goto cleanup;
+    }
+
+    // The legacy VAULTL2 index was encrypted directly with the master key.
+    result = read_log_index(fd, &slot, g_vault.master_key);
+    if (result != VAULT_OK)
+      goto cleanup;
+    result = log_validate_entry_ranges(&slot, log_legacy_header_size());
+    if (result != VAULT_OK)
+      goto cleanup;
+
+    g_vault.is_open = 1;
+    result = migrate_active_to_log(path);
+    if (result != VAULT_OK) {
+      LOGE("Legacy VAULTL2 migration failed: %d", result);
+      goto cleanup;
+    }
+    LOGI("Legacy VAULTL2 migrated to protected index-key roots");
+    goto cleanup;
   }
-  if (temp_path) {
-    unlink(temp_path); // Clean up temp file on error
-    free(temp_path);
+  result = log_select_slot(fd, &super, file_size, &slot, &slot_index);
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  result = vault_kdf_derive_with_params(
+      passphrase, pass_len, slot.kdf_salt, slot.kdf_mem, slot.kdf_iter, kek);
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  size_t master_key_len = 0;
+  result = vault_aead_decrypt(
+      kek, slot.wrapped_mk, slot.vault_id, VAULT_ID_LEN,
+      slot.wrapped_mk + VAULT_NONCE_LEN, VAULT_KEY_LEN + VAULT_TAG_LEN,
+      g_vault.master_key, &master_key_len);
+  if (result != VAULT_OK || master_key_len != VAULT_KEY_LEN) {
+    result = VAULT_ERR_AUTH_FAIL;
+    goto cleanup;
+  }
+  if (!log_root_tag_valid(&slot, g_vault.master_key)) {
+    result = VAULT_ERR_CORRUPTED;
+    goto cleanup;
+  }
+  result = log_unwrap_index_key(g_vault.master_key, slot.vault_id, slot.seq,
+                                slot.wrapped_index_key, index_key);
+  if (result != VAULT_OK) {
+    result = VAULT_ERR_CORRUPTED;
+    goto cleanup;
   }
 
+  memcpy(g_vault.vault_id, slot.vault_id, VAULT_ID_LEN);
+  memcpy(g_vault.salt, slot.kdf_salt, VAULT_SALT_LEN);
+  memcpy(g_vault.wrapped_mk, slot.wrapped_mk, WRAPPED_MK_SIZE);
+  g_vault.wrapped_mk_len = WRAPPED_MK_SIZE;
+  g_vault.kdf_mem = slot.kdf_mem;
+  g_vault.kdf_iter = slot.kdf_iter;
+  g_vault.kdf_parallel = slot.kdf_parallel;
+  g_vault.container_format = VAULT_CONTAINER_LOG;
+  g_vault.commit_sequence = slot.seq;
+  g_vault.committed_size = slot.committed_size;
+  g_vault.index_offset = slot.index_offset;
+  g_vault.index_length = slot.index_length;
+  g_vault.active_root_slot = slot_index;
+  g_vault.path = strdup(path);
+  if (!g_vault.path) {
+    result = VAULT_ERR_MEMORY;
+    goto cleanup;
+  }
+
+  result = read_log_index(fd, &slot, index_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = log_validate_entry_ranges(&slot, log_header_size());
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  uint32_t mirror_slot_index =
+      (slot_index + 1) % VAULT_LOG_SLOT_COUNT;
+  vault_log_slot_t mirror_slot;
+  int needs_root_heal =
+      log_read_slot(fd, &super, mirror_slot_index, file_size, &mirror_slot) !=
+          VAULT_OK ||
+      memcmp(&mirror_slot, &slot, sizeof(slot)) != 0;
+
+  if (file_size > slot.committed_size || needs_root_heal) {
+    int write_fd = open(path, O_RDWR);
+    if (write_fd < 0) {
+      result = VAULT_ERR_IO;
+      goto cleanup;
+    }
+    if (file_size > slot.committed_size &&
+        ftruncate(write_fd, (off_t)slot.committed_size) != 0)
+      result = VAULT_ERR_IO;
+    if (result == VAULT_OK && needs_root_heal)
+      result = log_write_slot(write_fd, mirror_slot_index, &slot);
+    if (result == VAULT_OK && fsync(write_fd) != 0)
+      result = VAULT_ERR_IO;
+    close(write_fd);
+    if (result != VAULT_OK)
+      goto cleanup;
+  }
+
+  g_vault.is_open = 1;
+  log_refresh_metrics();
+
+cleanup:
+  vault_zeroize(kek, sizeof(kek));
+  vault_zeroize(index_key, sizeof(index_key));
+  if (result != VAULT_OK)
+    vault_close();
   return result;
 }
 
@@ -883,6 +1598,8 @@ int vault_open(const char *path, const uint8_t *passphrase, size_t pass_len) {
   if (g_vault.is_open) {
     vault_close();
   }
+
+  remove_stale_temp_file(path);
 
   int result = VAULT_OK;
   int fd = -1;
@@ -901,6 +1618,19 @@ int vault_open(const char *path, const uint8_t *passphrase, size_t pass_len) {
     result = VAULT_ERR_IO;
     goto cleanup;
   }
+
+  uint8_t file_magic[VAULT_MAGIC_LEN];
+  if (read_all_at(fd, file_magic, sizeof(file_magic), 0) != VAULT_OK) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+  if (memcmp(file_magic, VAULT_LOG_MAGIC, VAULT_MAGIC_LEN) == 0) {
+    result = open_log_container(fd, (uint64_t)st.st_size, path, passphrase,
+                                pass_len);
+    close(fd);
+    return result;
+  }
+
   if (st.st_size <= VAULT_HASH_LEN) {
     result = VAULT_ERR_CORRUPTED;
     goto cleanup;
@@ -1066,6 +1796,7 @@ int vault_open(const char *path, const uint8_t *passphrase, size_t pass_len) {
   g_vault.kdf_mem = header_kdf_mem;
   g_vault.kdf_iter = header_kdf_iter;
   g_vault.kdf_parallel = header_kdf_parallel;
+  g_vault.container_format = VAULT_CONTAINER_V1;
   g_vault.path = strdup(path);
   g_vault.wrapped_mk_len = header_wrapped_mk_len;
   memcpy(g_vault.wrapped_mk, wrapped_mk, header_wrapped_mk_len);
@@ -1091,30 +1822,15 @@ int vault_open(const char *path, const uint8_t *passphrase, size_t pass_len) {
     }
   }
 
-  // Update size metrics
-  struct stat st2;
-  if (stat(path, &st2) == 0) {
-    uint64_t total_size = (st2.st_size > 0) ? (uint64_t)st2.st_size : 0;
-    g_vault.total_size = total_size;
-
-    uint64_t max_offset = 0;
-    for (uint32_t i = 0; i < g_vault.entry_count; i++) {
-      vault_entry_t *entry = &g_vault.entries[i];
-      // FIX: Use chunk_count > 0 to determine if entry has chunks
-      if (entry->chunk_count > 0) {
-        for (uint32_t c = 0; c < entry->chunk_count; c++) {
-          uint64_t end = entry->chunks[c].offset + entry->chunks[c].length;
-          if (end > max_offset)
-            max_offset = end;
-        }
-      } else {
-        uint64_t end = entry->data_offset + entry->data_length;
-        if (end > max_offset)
-          max_offset = end;
-      }
-    }
-    g_vault.free_space =
-        (total_size > max_offset) ? (total_size - max_offset) : 0;
+  if (fd >= 0) {
+    close(fd);
+    fd = -1;
+  }
+  result = migrate_active_to_log(path);
+  if (result != VAULT_OK) {
+    LOGE("Vault migration deferred; continuing with legacy container");
+    legacy_refresh_metrics(path);
+    result = VAULT_OK;
   }
   LOGI("Vault opened successfully");
 
@@ -1354,64 +2070,187 @@ cleanup:
   return result;
 }
 
-// Write encrypted index section to file descriptor
-static int write_index_section(int fd, const uint8_t mk[VAULT_KEY_LEN],
-                               vault_entry_t *entries, uint32_t entry_count) {
-  uint8_t nonce[VAULT_NONCE_LEN];
-  uint8_t *plaintext = NULL;
-  uint8_t *ciphertext = NULL;
-  size_t pt_len = 0;
-  size_t ct_len = 0;
-  int result = VAULT_OK;
+static int copy_ciphertext_range(int fd_in, uint64_t source_offset,
+                                 uint64_t length, int fd_out,
+                                 uint8_t *buffer, size_t buffer_size) {
+  while (length > 0) {
+    size_t chunk = length > buffer_size ? buffer_size : (size_t)length;
+    int result = read_all_at(fd_in, buffer, chunk, source_offset);
+    if (result != VAULT_OK)
+      return result;
+    result = write_all(fd_out, buffer, chunk);
+    if (result != VAULT_OK)
+      return result;
+    source_offset += chunk;
+    length -= chunk;
+  }
+  return VAULT_OK;
+}
 
-  result = serialize_index(entries, entry_count, &plaintext, &pt_len);
-  if (result != VAULT_OK) {
+static int migrate_active_to_log(const char *path) {
+  if (!path || !g_vault.is_open)
+    return VAULT_ERR_INVALID_PARAM;
+
+  int result = VAULT_OK;
+  int fd_in = -1;
+  int fd_out = -1;
+  char *temp_path = NULL;
+  uint8_t *copy_buffer = NULL;
+  uint8_t *index_record = NULL;
+  size_t index_record_len = 0;
+  uint8_t index_key[VAULT_KEY_LEN] = {0};
+  uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE] = {0};
+  vault_entry_t *entries = NULL;
+
+  result = clone_entries(g_vault.entries, g_vault.entry_count, &entries);
+  if (result != VAULT_OK)
+    return result;
+
+  fd_in = open(path, O_RDONLY);
+  if (fd_in < 0) {
+    result = VAULT_ERR_IO;
     goto cleanup;
   }
 
-  ct_len = pt_len + VAULT_TAG_LEN;
-  ciphertext = malloc(ct_len);
-  if (!ciphertext) {
+  size_t path_len = strlen(path);
+  temp_path = malloc(path_len + 5);
+  if (!temp_path) {
+    result = VAULT_ERR_MEMORY;
+    goto cleanup;
+  }
+  snprintf(temp_path, path_len + 5, "%s.tmp", path);
+  fd_out = open(temp_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (fd_out < 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+
+  vault_log_super_t super;
+  log_init_super(&super);
+  vault_log_slot_t empty_slots[VAULT_LOG_SLOT_COUNT];
+  memset(empty_slots, 0, sizeof(empty_slots));
+  result = write_all(fd_out, &super, sizeof(super));
+  if (result == VAULT_OK)
+    result = write_all(fd_out, empty_slots, sizeof(empty_slots));
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  copy_buffer = malloc(1024 * 1024);
+  if (!copy_buffer) {
     result = VAULT_ERR_MEMORY;
     goto cleanup;
   }
 
-  result = vault_aead_encrypt(mk,
-                              NULL,    // Generate nonce
-                              NULL, 0, // No AAD for index
-                              plaintext, pt_len, ciphertext, nonce);
-
-  if (result != VAULT_OK) {
-    goto cleanup;
+  uint64_t output_offset = log_header_size();
+  for (uint32_t i = 0; i < g_vault.entry_count; i++) {
+    const vault_entry_t *source = &g_vault.entries[i];
+    vault_entry_t *destination = &entries[i];
+    if (source->chunk_count > 0) {
+      for (uint32_t c = 0; c < source->chunk_count; c++) {
+        uint64_t length = source->chunks[c].length;
+        destination->chunks[c].offset = output_offset;
+        result = copy_ciphertext_range(fd_in, source->chunks[c].offset,
+                                       length, fd_out, copy_buffer,
+                                       1024 * 1024);
+        if (result != VAULT_OK)
+          goto cleanup;
+        output_offset += length;
+      }
+    } else {
+      uint64_t length = source->data_length;
+      destination->data_offset = output_offset;
+      result = copy_ciphertext_range(fd_in, source->data_offset, length,
+                                     fd_out, copy_buffer, 1024 * 1024);
+      if (result != VAULT_OK)
+        goto cleanup;
+      output_offset += length;
+    }
   }
 
-  // Write: nonce || ct_len || ciphertext
-  if (write(fd, nonce, VAULT_NONCE_LEN) != VAULT_NONCE_LEN) {
+  const uint64_t sequence = 1;
+  vault_random_bytes(index_key, sizeof(index_key));
+  result = log_wrap_index_key(g_vault.master_key, g_vault.vault_id, sequence,
+                              index_key, wrapped_index_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = build_log_index_record(
+      entries, g_vault.entry_count, index_key, g_vault.vault_id,
+      sequence, &index_record, &index_record_len);
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  uint64_t index_offset = output_offset;
+  result = write_all(fd_out, index_record, index_record_len);
+  if (result != VAULT_OK)
+    goto cleanup;
+  uint64_t committed_size = index_offset + index_record_len;
+
+  if (fsync(fd_out) != 0) {
     result = VAULT_ERR_IO;
     goto cleanup;
   }
 
-  uint64_t ct_len_u64 = ct_len;
-  if (write(fd, &ct_len_u64, sizeof(ct_len_u64)) != sizeof(ct_len_u64)) {
+  vault_log_slot_t root;
+  result = log_fill_slot(
+      &root, sequence, g_vault.vault_id, g_vault.salt, g_vault.kdf_mem,
+      g_vault.kdf_iter, g_vault.kdf_parallel, g_vault.wrapped_mk,
+      wrapped_index_key, index_offset, index_record_len, committed_size,
+      g_vault.master_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = log_write_slot(fd_out, 0, &root);
+  if (result == VAULT_OK)
+    result = log_write_slot(fd_out, 1, &root);
+  if (result != VAULT_OK || fsync(fd_out) != 0) {
     result = VAULT_ERR_IO;
     goto cleanup;
   }
 
-  if (write(fd, ciphertext, ct_len) != (ssize_t)ct_len) {
+  close(fd_out);
+  fd_out = -1;
+  close(fd_in);
+  fd_in = -1;
+  if (rename(temp_path, path) != 0) {
     result = VAULT_ERR_IO;
     goto cleanup;
   }
+  fsync_parent_dir(path);
+
+  free_entries_array(g_vault.entries, g_vault.entry_count);
+  g_vault.entries = entries;
+  entries = NULL;
+  g_vault.container_format = VAULT_CONTAINER_LOG;
+  g_vault.commit_sequence = sequence;
+  g_vault.committed_size = committed_size;
+  g_vault.index_offset = index_offset;
+  g_vault.index_length = index_record_len;
+  g_vault.active_root_slot = 0;
+  log_refresh_metrics();
 
 cleanup:
-  if (plaintext) {
-    vault_zeroize(plaintext, pt_len);
-    free(plaintext);
+  if (fd_in >= 0)
+    close(fd_in);
+  if (fd_out >= 0)
+    close(fd_out);
+  if (result != VAULT_OK && temp_path)
+    unlink(temp_path);
+  free(temp_path);
+  free(copy_buffer);
+  vault_zeroize(index_key, sizeof(index_key));
+  vault_zeroize(wrapped_index_key, sizeof(wrapped_index_key));
+  if (index_record) {
+    vault_zeroize(index_record, index_record_len);
+    free(index_record);
   }
-  if (ciphertext) {
-    vault_zeroize(ciphertext, ct_len);
-    free(ciphertext);
-  }
+  if (entries)
+    free_entries_array(entries, g_vault.entry_count);
   return result;
+}
+
+int vault_compact_storage(void) {
+  if (!g_vault.is_open || !g_vault.path)
+    return VAULT_ERR_NOT_OPEN;
+  return migrate_active_to_log(g_vault.path);
 }
 
 // Read and decrypt index
@@ -1767,6 +2606,100 @@ cleanup_buffers:
   return result;
 }
 
+static int log_commit_index_with_credentials(
+    const uint8_t salt[VAULT_SALT_LEN], uint32_t kdf_mem, uint32_t kdf_iter,
+    uint32_t kdf_parallel, const uint8_t wrapped_mk[WRAPPED_MK_SIZE]) {
+  if (g_vault.container_format != VAULT_CONTAINER_LOG ||
+      g_vault.commit_sequence == UINT64_MAX) {
+    return VAULT_ERR_CORRUPTED;
+  }
+
+  int result = VAULT_OK;
+  int fd = -1;
+  uint8_t *index_record = NULL;
+  size_t index_record_len = 0;
+  uint8_t index_key[VAULT_KEY_LEN] = {0};
+  uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE] = {0};
+  uint64_t sequence = g_vault.commit_sequence + 1;
+
+  vault_random_bytes(index_key, sizeof(index_key));
+  result = log_wrap_index_key(g_vault.master_key, g_vault.vault_id, sequence,
+                              index_key, wrapped_index_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = build_log_index_record(
+      g_vault.entries, g_vault.entry_count, index_key, g_vault.vault_id,
+      sequence, &index_record, &index_record_len);
+  if (result != VAULT_OK)
+    goto cleanup;
+
+  fd = open(g_vault.path, O_RDWR);
+  if (fd < 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+  if (ftruncate(fd, (off_t)g_vault.committed_size) != 0 ||
+      lseek(fd, (off_t)g_vault.committed_size, SEEK_SET) < 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+
+  uint64_t index_offset = g_vault.committed_size;
+  result = write_all(fd, index_record, index_record_len);
+  if (result != VAULT_OK || fsync(fd) != 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+
+  uint64_t committed_size = index_offset + index_record_len;
+  uint32_t next_slot = (g_vault.active_root_slot + 1) % VAULT_LOG_SLOT_COUNT;
+  vault_log_slot_t root;
+  result = log_fill_slot(&root, sequence, g_vault.vault_id, salt, kdf_mem,
+                         kdf_iter, kdf_parallel, wrapped_mk,
+                         wrapped_index_key, index_offset, index_record_len,
+                         committed_size,
+                         g_vault.master_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = log_write_slot(fd, next_slot, &root);
+  if (result != VAULT_OK || fsync(fd) != 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+
+  // The new root is already durable. Mirror it over the previous slot so old
+  // credentials and old per-commit index keys are not retained in the live
+  // container. A failed mirror is healed on the next authenticated open.
+  int mirror_result = log_write_slot(fd, g_vault.active_root_slot, &root);
+  if (mirror_result != VAULT_OK || fsync(fd) != 0) {
+    LOGE("log_commit_index: failed to mirror committed root slot");
+  }
+
+  memcpy(g_vault.salt, salt, VAULT_SALT_LEN);
+  memcpy(g_vault.wrapped_mk, wrapped_mk, WRAPPED_MK_SIZE);
+  g_vault.wrapped_mk_len = WRAPPED_MK_SIZE;
+  g_vault.kdf_mem = kdf_mem;
+  g_vault.kdf_iter = kdf_iter;
+  g_vault.kdf_parallel = kdf_parallel;
+  g_vault.commit_sequence = sequence;
+  g_vault.committed_size = committed_size;
+  g_vault.index_offset = index_offset;
+  g_vault.index_length = index_record_len;
+  g_vault.active_root_slot = next_slot;
+  log_refresh_metrics();
+
+cleanup:
+  if (fd >= 0)
+    close(fd);
+  if (index_record) {
+    vault_zeroize(index_record, index_record_len);
+    free(index_record);
+  }
+  vault_zeroize(index_key, sizeof(index_key));
+  vault_zeroize(wrapped_index_key, sizeof(wrapped_index_key));
+  return result;
+}
+
 int vault_verify_password(const uint8_t *passphrase, size_t pass_len) {
   if (!passphrase || pass_len == 0) {
     return VAULT_ERR_INVALID_PARAM;
@@ -1895,6 +2828,14 @@ int vault_change_password(const uint8_t *old_passphrase, size_t old_pass_len,
   }
 
   LOGI("vault_change_password: Rewriting vault header...");
+
+  if (g_vault.container_format == VAULT_CONTAINER_LOG) {
+    result = log_commit_index_with_credentials(
+        new_salt, kdf_mem, kdf_iter, kdf_parallel, new_wrapped_mk);
+    if (result == VAULT_OK)
+      LOGI("vault_change_password: Password changed successfully");
+    goto cleanup;
+  }
 
   // Step 5: Stream-rewrite vault header and rehash without loading full file
   fd_in = open(g_vault.path, O_RDONLY);
@@ -2049,8 +2990,14 @@ cleanup:
   return result;
 }
 
+static int log_commit_current_index(void) {
+  return log_commit_index_with_credentials(
+      g_vault.salt, g_vault.kdf_mem, g_vault.kdf_iter,
+      g_vault.kdf_parallel, g_vault.wrapped_mk);
+}
+
 // ============================================================================
-// PERFORMANCE OPTIMIZATION: Index-only operations
+// Index-only operations
 // ============================================================================
 
 /**
@@ -2063,6 +3010,9 @@ int vault_save_index_only(void) {
     LOGE("vault_save_index_only: vault not open");
     return VAULT_ERR_NOT_OPEN;
   }
+
+  if (g_vault.container_format == VAULT_CONTAINER_LOG)
+    return log_commit_current_index();
 
   int result = VAULT_OK;
   int fd = -1;
@@ -2328,6 +3278,185 @@ cleanup:
   return result;
 }
 
+static int log_append_entry(const vault_entry_t *new_entry,
+                            const vault_payload_t *payload,
+                            const char *chunk_dir) {
+  int result = VAULT_OK;
+  int fd = -1;
+  uint8_t *index_record = NULL;
+  size_t index_record_len = 0;
+  uint8_t index_key[VAULT_KEY_LEN] = {0};
+  uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE] = {0};
+  uint8_t *copy_buffer = NULL;
+  vault_entry_t *entries = NULL;
+  vault_entry_t *entry_copy = NULL;
+  uint32_t new_count = g_vault.entry_count + 1;
+  uint32_t entries_count = g_vault.entry_count;
+
+  if (g_vault.commit_sequence == UINT64_MAX || new_count == 0)
+    return VAULT_ERR_CORRUPTED;
+
+  result = clone_entries(g_vault.entries, g_vault.entry_count, &entries);
+  if (result != VAULT_OK)
+    goto cleanup;
+  vault_entry_t *resized =
+      realloc(entries, new_count * sizeof(vault_entry_t));
+  if (!resized) {
+    result = VAULT_ERR_MEMORY;
+    goto cleanup;
+  }
+  entries = resized;
+  memset(&entries[g_vault.entry_count], 0, sizeof(vault_entry_t));
+  entries_count = new_count;
+
+  result = clone_entries(new_entry, 1, &entry_copy);
+  if (result != VAULT_OK)
+    goto cleanup;
+  entries[g_vault.entry_count] = entry_copy[0];
+  free(entry_copy);
+  entry_copy = NULL;
+  vault_entry_t *destination = &entries[g_vault.entry_count];
+
+  fd = open(g_vault.path, O_RDWR);
+  if (fd < 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+  if (ftruncate(fd, (off_t)g_vault.committed_size) != 0 ||
+      lseek(fd, (off_t)g_vault.committed_size, SEEK_SET) < 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+
+  uint64_t output_offset = g_vault.committed_size;
+  if (new_entry->chunk_count > 0) {
+    if (chunk_dir) {
+      copy_buffer = malloc(1024 * 1024);
+      if (!copy_buffer) {
+        result = VAULT_ERR_MEMORY;
+        goto cleanup;
+      }
+    }
+    for (uint32_t c = 0; c < new_entry->chunk_count; c++) {
+      destination->chunks[c].offset = output_offset;
+      if (payload) {
+        size_t length = payload->chunk_lens[c];
+        if (length > UINT32_MAX) {
+          result = VAULT_ERR_INVALID_PARAM;
+          goto cleanup;
+        }
+        destination->chunks[c].length = (uint32_t)length;
+        result = write_all(fd, payload->chunks[c], length);
+        if (result != VAULT_OK)
+          goto cleanup;
+        output_offset += length;
+        continue;
+      }
+
+      size_t chunk_path_len = strlen(chunk_dir) + 32;
+      char *chunk_path = malloc(chunk_path_len);
+      if (!chunk_path) {
+        result = VAULT_ERR_MEMORY;
+        goto cleanup;
+      }
+      snprintf(chunk_path, chunk_path_len, "%s/chunk_%08u.enc", chunk_dir, c);
+      int chunk_fd = open(chunk_path, O_RDONLY);
+      free(chunk_path);
+      if (chunk_fd < 0) {
+        result = VAULT_ERR_IO;
+        goto cleanup;
+      }
+
+      uint8_t nonce[VAULT_NONCE_LEN];
+      result = read_all_at(chunk_fd, nonce, sizeof(nonce), 0);
+      uint64_t length = new_entry->chunks[c].length;
+      if (result == VAULT_OK &&
+          sodium_memcmp(nonce, new_entry->chunks[c].nonce, sizeof(nonce)) != 0)
+        result = VAULT_ERR_CORRUPTED;
+      if (result == VAULT_OK)
+        result = copy_ciphertext_range(chunk_fd, VAULT_NONCE_LEN, length, fd,
+                                       copy_buffer, 1024 * 1024);
+      close(chunk_fd);
+      if (result != VAULT_OK)
+        goto cleanup;
+      destination->chunks[c].length = (uint32_t)length;
+      output_offset += length;
+    }
+  } else {
+    destination->data_offset = output_offset;
+    destination->data_length = payload->data_len;
+    result = write_all(fd, payload->data, payload->data_len);
+    if (result != VAULT_OK)
+      goto cleanup;
+    output_offset += payload->data_len;
+  }
+
+  uint64_t sequence = g_vault.commit_sequence + 1;
+  vault_random_bytes(index_key, sizeof(index_key));
+  result = log_wrap_index_key(g_vault.master_key, g_vault.vault_id, sequence,
+                              index_key, wrapped_index_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = build_log_index_record(
+      entries, new_count, index_key, g_vault.vault_id, sequence,
+      &index_record, &index_record_len);
+  if (result != VAULT_OK)
+    goto cleanup;
+  uint64_t index_offset = output_offset;
+  result = write_all(fd, index_record, index_record_len);
+  if (result != VAULT_OK || fsync(fd) != 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+
+  uint64_t committed_size = index_offset + index_record_len;
+  uint32_t next_slot = (g_vault.active_root_slot + 1) % VAULT_LOG_SLOT_COUNT;
+  vault_log_slot_t root;
+  result = log_fill_slot(
+      &root, sequence, g_vault.vault_id, g_vault.salt, g_vault.kdf_mem,
+      g_vault.kdf_iter, g_vault.kdf_parallel, g_vault.wrapped_mk,
+      wrapped_index_key, index_offset, index_record_len, committed_size,
+      g_vault.master_key);
+  if (result != VAULT_OK)
+    goto cleanup;
+  result = log_write_slot(fd, next_slot, &root);
+  if (result != VAULT_OK || fsync(fd) != 0) {
+    result = VAULT_ERR_IO;
+    goto cleanup;
+  }
+
+  int mirror_result = log_write_slot(fd, g_vault.active_root_slot, &root);
+  if (mirror_result != VAULT_OK || fsync(fd) != 0)
+    LOGE("log_append_entry: failed to mirror committed root slot");
+
+  free_entries_array(g_vault.entries, g_vault.entry_count);
+  g_vault.entries = entries;
+  g_vault.entry_count = new_count;
+  entries = NULL;
+  g_vault.commit_sequence = sequence;
+  g_vault.committed_size = committed_size;
+  g_vault.index_offset = index_offset;
+  g_vault.index_length = index_record_len;
+  g_vault.active_root_slot = next_slot;
+  log_refresh_metrics();
+
+cleanup:
+  if (fd >= 0)
+    close(fd);
+  if (index_record) {
+    vault_zeroize(index_record, index_record_len);
+    free(index_record);
+  }
+  vault_zeroize(index_key, sizeof(index_key));
+  vault_zeroize(wrapped_index_key, sizeof(wrapped_index_key));
+  free(copy_buffer);
+  if (entry_copy)
+    free_entries_array(entry_copy, 1);
+  if (entries)
+    free_entries_array(entries, entries_count);
+  return result;
+}
+
 /**
  * Append a new entry to the vault without rebuilding entire container.
  * Appends encrypted payload at end of file and updates index only.
@@ -2335,8 +3464,8 @@ cleanup:
  * SECURITY:
  * - New payload is encrypted before write
  * - Existing data blobs remain untouched
- * - Integrity hash is recalculated
- * - Uses temp file + atomic rename for crash safety
+ * - A fresh per-commit key authenticates the encrypted index
+ * - The durable root-slot switch makes the append crash-safe
  *
  * @param new_entry Entry metadata (will be copied, caller retains ownership)
  * @param payload Encrypted payload data to append
@@ -2355,6 +3484,9 @@ static int vault_append_entry_internal(const vault_entry_t *new_entry,
        payload->chunk_count != new_entry->chunk_count)) {
     return VAULT_ERR_INVALID_PARAM;
   }
+
+  if (g_vault.container_format == VAULT_CONTAINER_LOG)
+    return log_append_entry(new_entry, payload, chunk_dir);
 
   int result = VAULT_OK;
   int fd_in = -1;

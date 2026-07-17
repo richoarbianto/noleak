@@ -232,4 +232,111 @@ void main() {
     SecureKeyboard.hide();
     await tester.pump();
   });
+
+  testWidgets('secure keyboard edits UTF-8 input at the cursor',
+      (tester) async {
+    final controller = TextEditingController(text: 'a🔐c');
+    addTearDown(controller.dispose);
+    late BuildContext context;
+    await tester.pumpWidget(MaterialApp(
+      home: SecureKeyboardHost(
+        child: Builder(builder: (value) {
+          context = value;
+          return const SizedBox();
+        }),
+      ),
+    ));
+
+    SecureKeyboard.show(
+      context,
+      controller: controller,
+      secureInput: true,
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byIcon(Icons.keyboard_arrow_left));
+    await tester.tap(find.text('b'));
+    await tester.pump();
+    var bytes = SecureKeyboard.copyInput(controller)!;
+    expect(bytes, utf8.encode('a🔐bc'));
+    SecurePassphrase.zeroize(bytes);
+
+    await tester.tap(find.byIcon(Icons.backspace));
+    await tester.tap(find.byIcon(Icons.backspace));
+    await tester.pump();
+    bytes = SecureKeyboard.copyInput(controller)!;
+    expect(bytes, utf8.encode('ac'));
+    SecurePassphrase.zeroize(bytes);
+
+    SecureKeyboard.setObscured(controller, false);
+    expect(controller.text, 'ac');
+    expect(controller.selection, const TextSelection.collapsed(offset: 1));
+
+    SecurePassphrase.clearController(controller);
+    SecureKeyboard.hide();
+    await tester.pump();
+  });
+
+  testWidgets('secure keyboard edits normal input at the cursor',
+      (tester) async {
+    final controller = TextEditingController(text: 'ac');
+    addTearDown(controller.dispose);
+    late BuildContext context;
+    await tester.pumpWidget(MaterialApp(
+      home: SecureKeyboardHost(
+        child: Builder(builder: (value) {
+          context = value;
+          return const SizedBox();
+        }),
+      ),
+    ));
+
+    SecureKeyboard.show(context, controller: controller);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.keyboard_arrow_left));
+    await tester.tap(find.text('b'));
+    await tester.pump();
+
+    expect(controller.text, 'abc');
+    expect(controller.selection, const TextSelection.collapsed(offset: 2));
+
+    SecureKeyboard.hide();
+    await tester.pump();
+  });
+
+  testWidgets('secure input honors cursor placement from the field',
+      (tester) async {
+    final controller = TextEditingController(text: 'a🔐c');
+    addTearDown(controller.dispose);
+    late BuildContext context;
+    await tester.pumpWidget(MaterialApp(
+      home: SecureKeyboardHost(
+        child: Builder(builder: (value) {
+          context = value;
+          return const SizedBox();
+        }),
+      ),
+    ));
+
+    SecureKeyboard.show(
+      context,
+      controller: controller,
+      secureInput: true,
+    );
+    await tester.pumpAndSettle();
+
+    controller.selection = const TextSelection.collapsed(offset: 1);
+    await tester.tap(find.text('b'));
+    await tester.pump();
+
+    final bytes = SecureKeyboard.copyInput(controller)!;
+    expect(bytes, utf8.encode('ab🔐c'));
+    SecurePassphrase.zeroize(bytes);
+    SecureKeyboard.setObscured(controller, false);
+    expect(controller.selection, const TextSelection.collapsed(offset: 2));
+
+    SecurePassphrase.clearController(controller);
+    SecureKeyboard.hide();
+    await tester.pump();
+  });
 }

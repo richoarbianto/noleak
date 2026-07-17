@@ -148,6 +148,7 @@ typedef struct {
 typedef struct {
   int is_open;
   char *path;
+  uint32_t container_format;
   uint8_t vault_id[VAULT_ID_LEN];
   uint8_t master_key[VAULT_KEY_LEN];
   uint8_t salt[VAULT_SALT_LEN];
@@ -166,6 +167,13 @@ typedef struct {
   // Wrapped master key (stored from header for rewrites)
   uint8_t wrapped_mk[VAULT_NONCE_LEN + VAULT_KEY_LEN + VAULT_TAG_LEN];
   size_t wrapped_mk_len;
+
+  // Append-only container commit state.
+  uint64_t commit_sequence;
+  uint64_t committed_size;
+  uint64_t index_offset;
+  uint64_t index_length;
+  uint32_t active_root_slot;
 } vault_state_t;
 
 // Payload holder for writing container data
@@ -434,6 +442,9 @@ int vault_list_files(vault_entry_t **entries_out, uint32_t *count_out);
  * @return VAULT_OK on success
  */
 int vault_compact(void);
+
+/** Rewrite active ciphertext into a compact append-only container. */
+int vault_compact_storage(void);
 
 /**
  * Change vault password

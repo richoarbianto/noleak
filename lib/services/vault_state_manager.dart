@@ -794,6 +794,11 @@ class VaultStateManager extends ChangeNotifier {
     SecureLogger.d('VaultStateManager',
         '_upsertSystemFile: starting for $name, size=${data.length}');
 
+    final previous = (await VaultChannel.listFiles())
+        .where((entry) => entry['name'] == name)
+        .map((entry) => List<int>.from(entry['fileId'] as List))
+        .toList();
+
     SecureLogger.d(
         'VaultStateManager', '_upsertSystemFile: appending system file $name');
     final created = await VaultChannel.importBytes(
@@ -813,6 +818,15 @@ class VaultStateManager extends ChangeNotifier {
     });
     if (!saved) {
       throw Exception('System file was not persisted: $name');
+    }
+
+    for (final fileId in previous) {
+      try {
+        await VaultChannel.deleteFile(fileId);
+      } catch (e) {
+        SecureLogger.w('VaultStateManager',
+            '_upsertSystemFile: stale $name cleanup deferred: $e');
+      }
     }
   }
 

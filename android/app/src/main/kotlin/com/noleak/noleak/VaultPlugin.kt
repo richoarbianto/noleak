@@ -223,6 +223,10 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         secureKeyManager = SecureKeyManager(context)
         safFileHandler = SafFileHandler(context)
         cleanupStalePlaintextCache(context.cacheDir)
+        cleanupStaleEncryptedVaultTemps(
+            context.cacheDir,
+            File(context.filesDir, "vault")
+        )
         streamingImportHandler = StreamingImportHandler(context)
         videoPlayerManager = VideoPlayerManager.getInstance(vaultBridge)
         audioPlayerManager = AudioPlayerManager.getInstance(vaultBridge)
@@ -1365,6 +1369,21 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         }
     }
 
+    private fun cleanupStaleEncryptedVaultTemps(cacheDir: File, vaultDir: File) {
+        cacheDir.listFiles()?.forEach { file ->
+            if (file.isFile && file.name.startsWith("vault_import_") &&
+                file.name.endsWith(".tmp")) {
+                file.delete()
+            }
+        }
+        vaultDir.listFiles()?.forEach { file ->
+            if (file.isFile && (file.name.endsWith(".dat.tmp") ||
+                    file.name.endsWith(".import.tmp"))) {
+                file.delete()
+            }
+        }
+    }
+
     private fun secureDeleteFile(file: File) {
         try {
             if (!file.exists() || !file.isFile) return
@@ -1732,7 +1751,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             val read = fis.read(magic)
             if (read != 7) return@use false
             val marker = String(magic, Charsets.US_ASCII)
-            marker == "VAULTv1" || marker == "VAULTJ1"
+            marker == "VAULTL2" || marker == "VAULTv1" || marker == "VAULTJ1"
         }
     }
     

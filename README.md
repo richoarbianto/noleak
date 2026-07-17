@@ -79,7 +79,7 @@ NoLeak has no cloud sync, remote account, server-side recovery, or passphrase re
 - Optional biometric app lock can protect application launch separately from vault unlock.
 - Configurable idle auto-lock: 10, 15, 20, or 30 seconds.
 - Configurable biometric session re-authentication: 3, 5, or 10 minutes.
-- Secure on-screen keyboard is enabled by default and can be disabled in settings.
+- Secure on-screen keyboard is enabled by default, supports in-app cursor navigation, and can be disabled in settings.
 - Persistent per-vault backoff protects app-mediated password checks, including open, verify, title changes, password changes, and deletion. After five failures, lockout starts at one minute and doubles up to 30 minutes.
 
 ## Supported imports
@@ -113,7 +113,9 @@ prefix for the raw preview and does not create a plaintext temporary file.
 
 Video and PDF use streaming/page-based paths. Image, Office, and audio flows that require a complete in-memory buffer reject files above the 64 MiB viewer limit instead of risking an out-of-memory crash.
 
-Streaming import is memory-bounded, but its crash-safe final commit uses both encrypted pending chunks and an atomic temporary container. Before importing a file of size `N`, plan for roughly `current vault size + 2N` of free storage at peak.
+Streaming import is memory-bounded. While an import is resumable, encrypted pending chunks use about `N` bytes; finalization appends about another `N` bytes of encrypted payload before those chunks are removed. Leave roughly `2N` of free storage for an import of size `N`.
+
+Append-only metadata commits can leave retired encrypted index records and deleted-file ciphertext in the container until storage compaction. This can increase the container file size, but retired per-commit index keys prevent those old records from restoring deleted files through the live vault.
 
 ## Security model
 
@@ -128,7 +130,7 @@ Implemented controls include:
 - imported vault headers are validated before registration, and the app warns when their memory or work-factor profile exceeds the profile selected for the current device;
 - a random vault master key wrapped by the passphrase-derived key;
 - a separate random data-encryption key for each file, wrapped by the vault master key;
-- authenticated file data and an authenticated encrypted index, plus a SHA-256 container consistency hash;
+- authenticated file data and an authenticated encrypted index selected through a crash-safe, dual-slot root journal;
 - Android Keystore and AndroidX Biometric integration for biometric-gated flows;
 - passphrases transported through app-controlled Dart, Kotlin, and JNI APIs as mutable UTF-8 byte buffers that are zeroized after use;
 - native key and plaintext-buffer zeroization, with best-effort `sodium_mlock` protection for the in-memory master key;
@@ -161,11 +163,16 @@ Passphrase
 | Key derivation | Argon2id |
 | Randomness | libsodium CSPRNG |
 | Container index | Authenticated encryption with file/chunk offsets and metadata |
-| Container consistency | SHA-256 over container contents; AEAD tags authenticate encrypted data and metadata |
+| Container commits | Dual authenticated root slots select the latest durable encrypted index |
+| Integrity | Root and index authentication is checked at unlock; file/chunk AEAD is checked when content is read |
 | Registry metadata | Android Keystore-backed encryption |
 | Biometrics | AndroidX Biometric / Android Keystore |
 
-The native container stores its header, wrapped master key, encrypted index, and encrypted payloads in one file. Metadata-only changes use atomic temporary-file replacement and only update in-memory offsets after the new container is durable. `VAULTv1` is the current format; legacy `VAULTJ1` containers are accepted and migrated to the current layout when opened successfully.
+The current `VAULTL2` container stores its header, wrapped master key, encrypted index records, and encrypted payloads in one file. A commit appends new encrypted data and an encrypted index, flushes them, then switches the inactive authenticated root slot and flushes again. Every commit uses a fresh index key; after the root slots are mirrored, older index records and deleted-file keys are no longer recoverable from the live container. Opening a vault validates the root and index without scanning every payload byte. Each affected file or chunk is still authenticated before plaintext is returned. Metadata-only operations append an index record instead of copying the whole container, so rename, move, and delete time is not proportional to total vault payload size.
+
+Existing `VAULTv1` and `VAULTJ1` vaults remain supported. NoLeak validates the legacy container before a bounded-memory migration to `VAULTL2`; if migration cannot complete, the original file remains intact and opens through the legacy path so migration can be retried later. Early `VAULTL2` roots without wrapped per-commit index keys are also authenticated with their original layout and atomically migrated before use; a failed migration leaves the original container unchanged. SHA-256 remains in use for IDs, source fingerprints, and legacy `VAULTv1` consistency validation, while active `VAULTL2` data and metadata use authenticated encryption.
+
+Vault creation, legacy migration, and storage compaction may create a sibling `.tmp` file with mode `0600`. It contains only the encrypted container representation—never plaintext. Successful operations flush and atomically rename it; handled failures remove it; and the next create/open removes an encrypted stale `.tmp` left by an abrupt process or power loss. Vault-import staging files also contain an encrypted exported container, and stale staging files are removed at application startup. Normal `VAULTL2` rename, move, delete, and file-import commits do not create a temporary container.
 
 ## Project layout
 

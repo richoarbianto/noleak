@@ -31,11 +31,8 @@ void vault_generate_id(uint8_t id_out[VAULT_ID_LEN]);
 // Forward declarations - some are non-static for use by vault_streaming.c
 void free_entries_array(vault_entry_t *entries, uint32_t count);
 static void free_payload(vault_payload_t *payload);
-void free_payloads(vault_payload_t *payloads, uint32_t count);
 int clone_entries(const vault_entry_t *source, uint32_t count,
                   vault_entry_t **dest_out);
-int load_payloads_for_entries(const vault_entry_t *entries, uint32_t count,
-                              vault_payload_t *payloads);
 static int build_text_image_entry(const uint8_t *data, size_t len, uint8_t type,
                                   const char *name, const char *mime,
                                   vault_entry_t *entry_out,
@@ -43,12 +40,9 @@ static int build_text_image_entry(const uint8_t *data, size_t len, uint8_t type,
 static int build_video_entry(const uint8_t *data, size_t len, const char *name,
                              const char *mime, vault_entry_t *entry_out,
                              vault_payload_t *payload_out);
-static int rebuild_container(vault_entry_t *entries, vault_payload_t *payloads,
-                             uint32_t count);
 static int unwrap_dek(const vault_entry_t *entry,
                       uint8_t dek_out[VAULT_KEY_LEN]);
 static int load_blob(uint64_t offset, uint64_t length, uint8_t **out);
-static uint64_t compute_used_space(void);
 static void clear_entry_allocations(vault_entry_t *entry);
 
 static int is_allowed_system_name(const char *name) {
@@ -107,9 +101,8 @@ int vault_import_file(const uint8_t *data, size_t len, uint8_t type,
   }
   LOGI("vault_import_file: entry built successfully");
 
-  // PERFORMANCE OPTIMIZATION: Use append-only instead of full rebuild
-  // This appends new data at end of file without loading existing payloads
-  // O(1) instead of O(n)
+  // Append only the new encrypted payload and updated index; existing payloads
+  // are never loaded or copied.
   result = vault_append_entry(&new_entry, &new_payload);
 
   // Copy file_id BEFORE freeing entry (vault_append_entry made deep copies)
@@ -305,9 +298,8 @@ int vault_delete_file(const uint8_t file_id[VAULT_ID_LEN]) {
   if (result != VAULT_OK)
     return result;
 
-  // PERFORMANCE OPTIMIZATION: Soft delete - remove from index only
-  // Data blob remains orphaned (will be reclaimed by vault_compact)
-  // This is O(1) instead of O(n)
+  // Remove from the encrypted index only. The retired per-commit index key
+  // makes the orphaned ciphertext inaccessible; compaction reclaims its space.
 
   uint32_t new_count = g_vault.entry_count - 1;
 
@@ -393,8 +385,7 @@ int vault_rename_file(const uint8_t file_id[VAULT_ID_LEN],
   if (result != VAULT_OK)
     return result;
 
-  // PERFORMANCE OPTIMIZATION: Update name in-place, then save index only
-  // No need to load all payloads - O(1) instead of O(n)
+  // Update only the encrypted index; payload size does not affect this commit.
   char *new_name_copy = strdup(new_name);
   if (!new_name_copy) {
     free_entries_array(backup_entries, entry_count);
@@ -445,49 +436,12 @@ int vault_compact(void) {
   if (g_vault.total_size == 0)
     return VAULT_OK;
 
-  uint64_t used_space = compute_used_space();
-  if (used_space == 0 || g_vault.total_size == 0) {
-    return VAULT_OK;
-  }
-
-  uint64_t free_space =
-      (g_vault.total_size > used_space) ? (g_vault.total_size - used_space) : 0;
-  if (free_space * 100 < g_vault.total_size * 25) {
+  if (g_vault.free_space * 100 < g_vault.total_size * 25) {
     LOGI("Compaction not needed (free space %llu bytes)",
-         (unsigned long long)free_space);
+         (unsigned long long)g_vault.free_space);
     return VAULT_OK;
   }
-
-  // Repack container with current entries
-  vault_entry_t *cloned_entries = NULL;
-  int result =
-      clone_entries(g_vault.entries, g_vault.entry_count, &cloned_entries);
-  if (result != VAULT_OK) {
-    return result;
-  }
-
-  vault_payload_t *payloads =
-      calloc(g_vault.entry_count, sizeof(vault_payload_t));
-  if (!payloads) {
-    free_entries_array(cloned_entries, g_vault.entry_count);
-    return VAULT_ERR_MEMORY;
-  }
-
-  result =
-      load_payloads_for_entries(g_vault.entries, g_vault.entry_count, payloads);
-  if (result != VAULT_OK) {
-    free_entries_array(cloned_entries, g_vault.entry_count);
-    free_payloads(payloads, g_vault.entry_count);
-    return result;
-  }
-
-  result = rebuild_container(cloned_entries, payloads, g_vault.entry_count);
-  free_payloads(payloads, g_vault.entry_count);
-
-  if (result != VAULT_OK) {
-    free_entries_array(cloned_entries, g_vault.entry_count);
-  }
-  return result;
+  return vault_compact_storage();
 }
 
 int vault_get_stats(uint64_t *total_size_out, uint64_t *free_space_out) {
@@ -542,15 +496,6 @@ static void free_payload(vault_payload_t *payload) {
     free(payload->chunk_lens);
   }
   memset(payload, 0, sizeof(*payload));
-}
-
-void free_payloads(vault_payload_t *payloads, uint32_t count) {
-  if (!payloads)
-    return;
-  for (uint32_t i = 0; i < count; i++) {
-    free_payload(&payloads[i]);
-  }
-  free(payloads);
 }
 
 int clone_entries(const vault_entry_t *source, uint32_t count,
@@ -610,79 +555,6 @@ int clone_entries(const vault_entry_t *source, uint32_t count,
   }
 
   *dest_out = dest;
-  return VAULT_OK;
-}
-
-int load_payloads_for_entries(const vault_entry_t *entries, uint32_t count,
-                              vault_payload_t *payloads) {
-  if (!entries || !payloads)
-    return VAULT_ERR_INVALID_PARAM;
-
-  int fd = open(g_vault.path, O_RDONLY);
-  if (fd < 0) {
-    return VAULT_ERR_IO;
-  }
-
-  for (uint32_t i = 0; i < count; i++) {
-    const vault_entry_t *entry = &entries[i];
-    vault_payload_t *payload = &payloads[i];
-
-    // FIX: Check chunk_count > 0 instead of just type == VIDEO
-    // Streaming import stores all large files as chunked, regardless of type
-    if (entry->chunk_count > 0) {
-      payload->chunk_count = entry->chunk_count;
-      payload->chunk_lens = calloc(entry->chunk_count, sizeof(size_t));
-      payload->chunks = calloc(entry->chunk_count, sizeof(uint8_t *));
-      if (!payload->chunk_lens || !payload->chunks) {
-        close(fd);
-        return VAULT_ERR_MEMORY;
-      }
-
-      for (uint32_t c = 0; c < entry->chunk_count; c++) {
-        uint64_t len = entry->chunks[c].length;
-        if (len == 0) {
-          close(fd);
-          return VAULT_ERR_CORRUPTED;
-        }
-        uint8_t *buf = malloc(len);
-        if (!buf) {
-          close(fd);
-          return VAULT_ERR_MEMORY;
-        }
-        ssize_t read_len = pread(fd, buf, len, entry->chunks[c].offset);
-        if (read_len != (ssize_t)len) {
-          vault_zeroize(buf, len);
-          free(buf);
-          close(fd);
-          return VAULT_ERR_IO;
-        }
-        payload->chunks[c] = buf;
-        payload->chunk_lens[c] = len;
-      }
-    } else {
-      if (entry->data_length == 0) {
-        close(fd);
-        return VAULT_ERR_CORRUPTED;
-      }
-      payload->data_len = entry->data_length;
-      payload->data = malloc(entry->data_length);
-      if (!payload->data) {
-        close(fd);
-        return VAULT_ERR_MEMORY;
-      }
-      ssize_t read_len =
-          pread(fd, payload->data, entry->data_length, entry->data_offset);
-      if (read_len != (ssize_t)entry->data_length) {
-        vault_zeroize(payload->data, entry->data_length);
-        free(payload->data);
-        payload->data = NULL;
-        close(fd);
-        return VAULT_ERR_IO;
-      }
-    }
-  }
-
-  close(fd);
   return VAULT_OK;
 }
 
@@ -874,25 +746,6 @@ error:
   return result;
 }
 
-static int rebuild_container(vault_entry_t *entries, vault_payload_t *payloads,
-                             uint32_t count) {
-  int result = vault_save_container(entries, payloads, count);
-  if (result != VAULT_OK) {
-    return result;
-  }
-
-  // Replace in-memory entries
-  if (g_vault.entries) {
-    for (uint32_t i = 0; i < g_vault.entry_count; i++) {
-      vault_free_entry(&g_vault.entries[i]);
-    }
-    free(g_vault.entries);
-  }
-  g_vault.entries = entries;
-  g_vault.entry_count = count;
-  return VAULT_OK;
-}
-
 static int unwrap_dek(const vault_entry_t *entry,
                       uint8_t dek_out[VAULT_KEY_LEN]) {
   if (!entry || !entry->wrapped_dek ||
@@ -938,24 +791,4 @@ static int load_blob(uint64_t offset, uint64_t length, uint8_t **out) {
 
   *out = buf;
   return VAULT_OK;
-}
-
-static uint64_t compute_used_space(void) {
-  uint64_t max_offset = 0;
-  for (uint32_t i = 0; i < g_vault.entry_count; i++) {
-    const vault_entry_t *entry = &g_vault.entries[i];
-    // FIX: Use chunk_count > 0 to determine if entry has chunks
-    if (entry->chunk_count > 0) {
-      for (uint32_t c = 0; c < entry->chunk_count; c++) {
-        uint64_t end = entry->chunks[c].offset + entry->chunks[c].length;
-        if (end > max_offset)
-          max_offset = end;
-      }
-    } else {
-      uint64_t end = entry->data_offset + entry->data_length;
-      if (end > max_offset)
-        max_offset = end;
-    }
-  }
-  return max_offset;
 }
