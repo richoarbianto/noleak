@@ -61,7 +61,8 @@ NoLeak has no cloud sync, remote account, server-side recovery, or passphrase re
 - Image viewer for supported image formats.
 - Bounded text and key-file previews.
 - PDF pages rendered through Android's native PDF renderer without creating a plaintext PDF cache file.
-- Text extraction previews for DOCX, XLSX, and PPTX with archive, entry-size, and output limits.
+- Text extraction previews for DOCX, XLSX, and PPTX with hard caps on actual
+  decompressed entry and aggregate output, independent of ZIP size metadata.
 - Audio and video playback backed by vault-aware Android media data sources.
 - Decrypted buffers and media sessions are cleared when viewers close or the vault locks.
 

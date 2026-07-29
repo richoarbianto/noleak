@@ -51,6 +51,7 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
   Uint8List? _pdfPagePng;
   int _pdfPageIndex = 0;
   int _pdfPageCount = 0;
+  int _archiveOutputBytes = 0;
   bool _truncated = false;
 
   @override
@@ -291,6 +292,7 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
   }
 
   Archive _decodeOfficeArchive(Uint8List data) {
+    _archiveOutputBytes = 0;
     final archive = ZipDecoder().decodeBytes(data, verify: false);
     if (archive.files.length > _maxArchiveFiles) {
       throw const FormatException('Office archive has too many entries.');
@@ -321,10 +323,35 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
     if (file.size > _maxArchiveEntryBytes) {
       throw const FormatException('Office archive entry is too large.');
     }
-    final content = file.content;
-    if (content is Uint8List) return content;
-    if (content is List<int>) return Uint8List.fromList(content);
-    return Uint8List(0);
+    final remainingArchiveBytes = _maxArchiveBytes - _archiveOutputBytes;
+    if (remainingArchiveBytes <= 0) {
+      throw const FormatException(
+          'Office archive expands beyond preview limit.');
+    }
+
+    final entryLimit = remainingArchiveBytes < _maxArchiveEntryBytes
+        ? remainingArchiveBytes
+        : _maxArchiveEntryBytes;
+    final output = _BoundedOutputStream(
+      entryLimit,
+      remainingArchiveBytes < _maxArchiveEntryBytes
+          ? 'Office archive expands beyond preview limit.'
+          : 'Office archive entry is too large.',
+    );
+    final rawContent = file.rawContent;
+    if (rawContent == null) return Uint8List(0);
+    final input = rawContent.peekBytes(rawContent.length);
+    if (file.compressionType == ArchiveFile.DEFLATE) {
+      Inflate.stream(input, output);
+    } else if (file.compressionType == ArchiveFile.STORE) {
+      output.writeInputStream(input);
+    } else {
+      throw const FormatException(
+          'Office archive uses unsupported compression.');
+    }
+
+    _archiveOutputBytes += output.length;
+    return output.getBytes() as Uint8List;
   }
 
   void _appendLine(StringBuffer buffer, String line) {
@@ -476,6 +503,37 @@ class _DocumentViewerScreenState extends State<DocumentViewerScreen> {
         ),
       ],
     );
+  }
+}
+
+class _BoundedOutputStream extends OutputStream {
+  _BoundedOutputStream(this.maxLength, this.errorMessage);
+
+  final int maxLength;
+  final String errorMessage;
+
+  void _checkWrite(int count) {
+    if (count < 0 || count > maxLength - length) {
+      throw FormatException(errorMessage);
+    }
+  }
+
+  @override
+  void writeByte(int value) {
+    _checkWrite(1);
+    super.writeByte(value);
+  }
+
+  @override
+  void writeBytes(List<int> bytes, [int? len]) {
+    _checkWrite(len ?? bytes.length);
+    super.writeBytes(bytes, len);
+  }
+
+  @override
+  void writeInputStream(InputStreamBase stream) {
+    _checkWrite(stream.length);
+    super.writeInputStream(stream);
   }
 }
 
