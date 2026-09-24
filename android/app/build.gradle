@@ -27,6 +27,17 @@ if (isReleaseBuild && !hasReleaseSigning) {
 if (isReleaseBuild && !signatureAllowlist.trim()) {
     throw new GradleException("Release signature allowlist missing. Set NOLEAK_SIGNATURE_SHA256 to the release signing certificate SHA-256 digest.")
 }
+if (isReleaseBuild && hasReleaseSigning) {
+    def store = java.security.KeyStore.getInstance(keystoreStoreFileRef, keystoreStorePassword.toCharArray())
+    def certificate = store.getCertificate(keystoreKeyAlias)
+    if (certificate == null) {
+        throw new GradleException("Release signing certificate not found in keystore.")
+    }
+    def actualDigest = java.security.MessageDigest.getInstance("SHA-256").digest(certificate.encoded).encodeHex().toString()
+    if (!signatureAllowlist.split(",").any { it.trim().equalsIgnoreCase(actualDigest) }) {
+        throw new GradleException("Release signature allowlist does not match the signing certificate.")
+    }
+}
 
 android {
     namespace = "com.noleak.noleak"
