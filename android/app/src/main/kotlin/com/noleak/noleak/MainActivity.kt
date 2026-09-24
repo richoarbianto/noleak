@@ -150,11 +150,8 @@ class MainActivity : FlutterFragmentActivity() {
         
         // Close vault engine
         try {
-            if (vaultEngine?.isOpen() == true) {
-                vaultEngine?.streamingCleanupOld(0)
-                vaultEngine?.close()
-                SecureLog.security("MainActivity", "Vault closed successfully")
-            }
+            vaultEngine?.close()
+            SecureLog.security("MainActivity", "Vault closed successfully")
         } catch (e: Exception) {
             SecureLog.e("MainActivity", "Error closing vault: ${e.message}")
         }

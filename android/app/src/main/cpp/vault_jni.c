@@ -140,8 +140,9 @@ Java_com_noleak_noleak_vault_VaultEngine_nativeInspectKdfInfo(
     uint32_t memory;
     uint32_t iterations;
     uint32_t parallelism;
+    int retirement_pending;
     int status = vault_inspect_kdf_params(c_path, &memory, &iterations,
-                                          &parallelism);
+                                          &parallelism, &retirement_pending);
     free(c_path);
     if (status != VAULT_OK) return NULL;
 
@@ -151,11 +152,11 @@ Java_com_noleak_noleak_vault_VaultEngine_nativeInspectKdfInfo(
     vault_get_kdf_params(&device_memory, &device_iterations,
                          &device_parallelism);
 
-    jlong values[6] = {(jlong)memory, (jlong)iterations, (jlong)parallelism,
+    jlong values[7] = {(jlong)memory, (jlong)iterations, (jlong)parallelism,
                        (jlong)device_memory, (jlong)device_iterations,
-                       (jlong)device_parallelism};
-    jlongArray result = (*env)->NewLongArray(env, 6);
-    if (result) (*env)->SetLongArrayRegion(env, result, 0, 6, values);
+                       (jlong)device_parallelism, (jlong)retirement_pending};
+    jlongArray result = (*env)->NewLongArray(env, 7);
+    if (result) (*env)->SetLongArrayRegion(env, result, 0, 7, values);
     return result;
 }
 

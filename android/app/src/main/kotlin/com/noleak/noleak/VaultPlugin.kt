@@ -9,10 +9,13 @@ import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
+import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
+import android.os.StatFs
 import android.provider.DocumentsContract
 import android.system.Os
 import android.system.OsConstants
+import android.system.StructPollfd
 import android.view.Surface
 import android.view.WindowManager
 import androidx.fragment.app.FragmentActivity
@@ -39,20 +42,30 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
 import io.flutter.view.TextureRegistry
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileDescriptor
 import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.IOException
+import kotlin.math.sqrt
 import com.noleak.noleak.security.SecureLog
 import com.noleak.noleak.security.PasswordRateLimiter
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.roundToInt
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * VaultPlugin - Flutter MethodChannel handler for vault operations
@@ -88,6 +101,12 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         private const val EXPORT_FILE_REQUEST = 1005
         private const val MIN_PASSPHRASE_BYTES = 12
         private const val MAX_PASSPHRASE_BYTES = 1024
+        private const val VAULT_IMPORT_RESERVE_BYTES = 256L * 1024 * 1024
+        private const val VAULT_PROVIDER_IDLE_TIMEOUT_MS = 30_000
+        private const val MAX_PDF_PREVIEW_SIDE = 8192
+        private const val MAX_PDF_PREVIEW_PIXELS = 4L * 1024 * 1024
+        private const val MAX_PDF_PREVIEW_BYTES = 16 * 1024 * 1024 + 64 * 1024
+        private val vaultImportMutex = Mutex()
         
         @Volatile
         private var instance: VaultPlugin? = null
@@ -199,6 +218,13 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         defaultCode: String
     ) {
         when {
+            error is VaultException &&
+                error.errorCode == VaultEngine.VAULT_ERR_RETIREMENT_PENDING ->
+                result.error(
+                    "VAULT_CLEANUP_PENDING",
+                    "The change was saved, but the previous vault root still needs cleanup. Close and reopen the vault before exporting.",
+                    null
+                )
             error is VaultException && error.errorCode == VaultEngine.VAULT_ERR_MEMORY ->
                 result.error(
                     "KDF_MEMORY_REQUIRED",
@@ -1202,24 +1228,35 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
 
                     val pageIndex = requestedPageIndex.coerceIn(0, pageCount - 1)
                     renderer.openPage(pageIndex).use { page ->
+                        val pageWidth = page.width
+                        val pageHeight = page.height
+                        if (pageWidth <= 0 || pageHeight <= 0) {
+                            throw IllegalStateException("PDF page has invalid dimensions")
+                        }
                         val width = requestedWidth.coerceIn(320, 1600)
-                        val scale = width.toFloat() / page.width.coerceAtLeast(1).toFloat()
-                        val height = (page.height * scale).roundToInt().coerceAtLeast(1)
-                        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                        val scale = minOf(
+                            width.toDouble() / pageWidth,
+                            MAX_PDF_PREVIEW_SIDE.toDouble() / pageWidth,
+                            MAX_PDF_PREVIEW_SIDE.toDouble() / pageHeight,
+                            sqrt(MAX_PDF_PREVIEW_PIXELS.toDouble() / (pageWidth.toDouble() * pageHeight))
+                        )
+                        val bitmapWidth = (pageWidth * scale).toInt().coerceAtLeast(1)
+                        val bitmapHeight = (pageHeight * scale).toInt().coerceAtLeast(1)
+                        if (bitmapWidth > MAX_PDF_PREVIEW_SIDE ||
+                            bitmapHeight > MAX_PDF_PREVIEW_SIDE ||
+                            bitmapWidth.toLong() * bitmapHeight > MAX_PDF_PREVIEW_PIXELS) {
+                            throw IllegalStateException("PDF preview exceeds safe dimensions")
+                        }
+                        val bitmap = Bitmap.createBitmap(bitmapWidth, bitmapHeight, Bitmap.Config.ARGB_8888)
                         try {
                             Canvas(bitmap).drawColor(Color.WHITE)
                             page.render(
                                 bitmap,
                                 null,
-                                Matrix().apply { postScale(scale, scale) },
+                                Matrix().apply { postScale(scale.toFloat(), scale.toFloat()) },
                                 PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
                             )
-                            val output = object : ByteArrayOutputStream() {
-                                override fun close() {
-                                    buf.fill(0)
-                                    super.close()
-                                }
-                            }
+                            val output = BoundedPreviewOutputStream(MAX_PDF_PREVIEW_BYTES)
                             output.use {
                                 bitmap.compress(Bitmap.CompressFormat.PNG, 90, it)
                                 return mapOf(
@@ -1257,7 +1294,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 },
                 onFailure = { e -> 
                     SecureLog.e("VaultPlugin", "handleDeleteFile: delete failed: ${e.message}")
-                    result.error("DELETE_FAILED", e.message, null) 
+                    reportVaultFailure(e, result, "DELETE_FAILED")
                 }
             )
         }
@@ -1438,7 +1475,7 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 },
                 onFailure = { e -> 
                     SecureLog.e("VaultPlugin", "handleRenameFile: failed: ${e.message}")
-                    result.error("RENAME_FAILED", e.message, null) 
+                    reportVaultFailure(e, result, "RENAME_FAILED")
                 }
             )
         }
@@ -1745,13 +1782,140 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         }
     }
 
-    private fun hasSupportedVaultMagic(file: File): Boolean {
-        return FileInputStream(file).use { fis ->
-            val magic = ByteArray(7)
-            val read = fis.read(magic)
-            if (read != 7) return@use false
-            val marker = String(magic, Charsets.US_ASCII)
-            marker == "VAULTL2" || marker == "VAULTv1" || marker == "VAULTJ1"
+    private fun hasSupportedVaultMagic(magic: ByteArray): Boolean {
+        val marker = String(magic, Charsets.US_ASCII)
+        return marker == "VAULTL2" || marker == "VAULTv1" || marker == "VAULTJ1"
+    }
+
+    private suspend fun openImportDescriptor(uri: Uri): ParcelFileDescriptor {
+        val resolver = activity?.contentResolver ?: throw IOException("No activity available")
+        return suspendCancellableCoroutine { continuation ->
+            val signal = CancellationSignal()
+            val descriptor = AtomicReference<ParcelFileDescriptor?>()
+            val opener = CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    val opened = resolver.openFileDescriptor(uri, "r", signal)
+                        ?: throw IOException("Could not open selected document")
+                    descriptor.set(opened)
+                    if (continuation.isActive) {
+                        continuation.resumeWith(Result.success(opened))
+                        descriptor.compareAndSet(opened, null)
+                    } else {
+                        descriptor.getAndSet(null)?.close()
+                    }
+                } catch (error: Throwable) {
+                    descriptor.getAndSet(null)?.close()
+                    if (continuation.isActive) {
+                        continuation.resumeWith(Result.failure(error))
+                    }
+                }
+            }
+            continuation.invokeOnCancellation {
+                signal.cancel()
+                descriptor.getAndSet(null)?.close()
+                opener.cancel()
+            }
+        }
+    }
+
+    private suspend fun readImportSource(
+        descriptor: ParcelFileDescriptor,
+        source: FileInputStream,
+        buffer: ByteArray,
+        offset: Int = 0,
+        length: Int = buffer.size
+    ): Int {
+        val pollDescriptor = StructPollfd().apply {
+            fd = descriptor.fileDescriptor
+            events = (OsConstants.POLLIN or OsConstants.POLLERR or OsConstants.POLLHUP).toShort()
+        }
+        val ready = runInterruptible {
+            Os.poll(arrayOf(pollDescriptor), VAULT_PROVIDER_IDLE_TIMEOUT_MS)
+        }
+        currentCoroutineContext().ensureActive()
+        if (ready == 0) throw IOException("Import source timed out")
+        return runInterruptible { source.read(buffer, offset, length) }
+    }
+
+    private suspend fun copyUriToFileWithSpaceReserve(
+        uri: Uri,
+        destination: File,
+        reportedSize: Long,
+        onProgress: suspend (Long, Long) -> Unit
+    ): Long {
+        return vaultImportMutex.withLock {
+            withContext(Dispatchers.IO) {
+                val parent = destination.parentFile ?: throw IOException("Import destination has no parent")
+                if (!parent.isDirectory && !parent.mkdirs()) {
+                    throw IOException("Could not create import destination")
+                }
+                val coroutineContext = currentCoroutineContext()
+                var copied = 0L
+                var lastPercent = -1
+                var lastProgressAt = System.currentTimeMillis()
+                val descriptor = openImportDescriptor(uri)
+
+                ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { source ->
+                    FileOutputStream(destination, false).use { output ->
+                        val magic = ByteArray(7)
+                        var magicBytes = 0
+                        while (magicBytes < magic.size) {
+                            coroutineContext.ensureActive()
+                            val read = readImportSource(
+                                descriptor,
+                                source,
+                                magic,
+                                magicBytes,
+                                magic.size - magicBytes
+                            )
+                            if (read < 0) throw IOException("Unsupported vault format")
+                            magicBytes += read
+                        }
+                        if (!hasSupportedVaultMagic(magic)) {
+                            throw IOException("Unsupported vault format")
+                        }
+                        val headerSpace =
+                            (StatFs(parent.absolutePath).availableBytes - VAULT_IMPORT_RESERVE_BYTES)
+                                .coerceAtLeast(0L)
+                        if (magic.size.toLong() > headerSpace) {
+                            throw IOException("Import stopped to preserve 256 MiB of free storage")
+                        }
+                        output.write(magic)
+                        copied = magic.size.toLong()
+
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            coroutineContext.ensureActive()
+                            val read = readImportSource(descriptor, source, buffer)
+                            if (read < 0) break
+                            if (read == 0) continue
+
+                            val writableBytes =
+                                (StatFs(parent.absolutePath).availableBytes - VAULT_IMPORT_RESERVE_BYTES)
+                                    .coerceAtLeast(0L)
+                            if (read.toLong() > writableBytes) {
+                                throw IOException("Import stopped to preserve 256 MiB of free storage")
+                            }
+
+                            output.write(buffer, 0, read)
+                            copied += read
+                            if (reportedSize > 0) {
+                                val percent = ((copied * 100) / reportedSize).toInt()
+                                if (percent != lastPercent) {
+                                    lastPercent = percent
+                                    onProgress(copied, reportedSize)
+                                }
+                            } else if (System.currentTimeMillis() - lastProgressAt >= 500) {
+                                lastProgressAt = System.currentTimeMillis()
+                                onProgress(copied, copied)
+                            }
+                        }
+                        output.flush()
+                        output.fd.sync()
+                    }
+                }
+                copied
+            }
         }
     }
     
@@ -1760,7 +1924,6 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         val vaultEngine = VaultEngine.getInstance(ctx)
         val totalBytes = safFileHandler.getFileSize(uri)
         var bytesCopied = 0L
-        var lastPercent = -1
         
         SecureLog.d("VaultPlugin", "importVaultFileFromUri: starting, totalBytes=$totalBytes")
         
@@ -1770,7 +1933,8 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         }
         
         // SECURITY: Declare tempFile outside try for cleanup in catch
-        val tempFile = File(ctx.cacheDir, "vault_import_${System.currentTimeMillis()}.tmp")
+        val tempFile = vaultRegistry.createImportTempFile()
+        var imported = false
         
         // Helper to emit progress on main thread
         suspend fun emitProgress(bytes: Long, total: Long, complete: Boolean = false, err: String? = null) {
@@ -1781,49 +1945,14 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         
         return try {
             emitProgress(bytesCopied, totalBytes)
-            // Copy to temp file first
-            ctx.contentResolver.openInputStream(uri)?.use { input ->
-                tempFile.outputStream().use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    var read = input.read(buffer)
-                    var lastEmitTime = System.currentTimeMillis()
-                    while (read > 0) {
-                        output.write(buffer, 0, read)
-                        bytesCopied += read.toLong()
-                        if (totalBytes > 0) {
-                            val percent = ((bytesCopied * 100) / totalBytes).toInt()
-                            if (percent != lastPercent) {
-                                lastPercent = percent
-                                emitProgress(bytesCopied, totalBytes)
-                            }
-                        } else {
-                            // Unknown total size - emit progress every 500ms
-                            val now = System.currentTimeMillis()
-                            if (now - lastEmitTime > 500) {
-                                lastEmitTime = now
-                                // Use bytesCopied as both values to show indeterminate progress
-                                emitProgress(bytesCopied, bytesCopied)
-                            }
-                        }
-                        read = input.read(buffer)
-                    }
-                    output.flush()
-                }
-            } ?: return null
+            bytesCopied = copyUriToFileWithSpaceReserve(uri, tempFile, totalBytes) { copied, total ->
+                emitProgress(copied, total)
+            }
             
             // After copy, we know the actual size
             val actualSize = tempFile.length()
             SecureLog.d("VaultPlugin", "importVaultFileFromUri: copy complete, actualSize=$actualSize")
             
-            // Validate vault magic
-            val ok = hasSupportedVaultMagic(tempFile)
-            if (!ok) {
-                SecureLog.e("VaultPlugin", "importVaultFileFromUri: invalid vault magic")
-                // SECURITY: Secure wipe temp file before deletion
-                vaultEngine.secureWipeFile(tempFile.absolutePath)
-                return null
-            }
-
             val kdfInfo = vaultEngine.inspectVaultKdfInfo(tempFile.absolutePath)
                 .getOrElse {
                     SecureLog.e("VaultPlugin", "importVaultFileFromUri: invalid KDF metadata")
@@ -1831,71 +1960,31 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                     return null
                 }
             
-            // Create registry entry and copy file
-            val entry = vaultRegistry.createVaultEntry()
-            if (entry == null) {
+            val metadata = vaultRegistry.addImportedVault(tempFile.absolutePath)
+            if (metadata == null) {
                 SecureLog.e("VaultPlugin", "importVaultFileFromUri: failed to create registry entry")
-                // SECURITY: Secure wipe temp file before deletion
                 vaultEngine.secureWipeFile(tempFile.absolutePath)
                 return null
             }
-            
-            val (vaultId, vaultPath) = entry
-            val vaultFile = File(vaultPath)
-            
-            SecureLog.d("VaultPlugin", "importVaultFileFromUri: moving temp file to vault location...")
-            
-            // Try to rename first (instant if same filesystem)
-            val renamed = tempFile.renameTo(vaultFile)
-            if (!renamed) {
-                // Fallback to copy if rename fails (different filesystem)
-                SecureLog.d("VaultPlugin", "importVaultFileFromUri: rename failed, falling back to copy...")
-                val tempSize = tempFile.length()
-                var copiedBytes = 0L
-                var lastCopyPercent = -1
-                
-                tempFile.inputStream().use { input ->
-                    vaultFile.outputStream().use { output ->
-                        val buffer = ByteArray(64 * 1024)
-                        var read = input.read(buffer)
-                        while (read > 0) {
-                            output.write(buffer, 0, read)
-                            copiedBytes += read
-                            val percent = ((copiedBytes * 100) / tempSize).toInt()
-                            if (percent != lastCopyPercent && percent % 5 == 0) {
-                                lastCopyPercent = percent
-                                // Emit as "finalizing" phase (100% + copy progress indicator)
-                                emitProgress(copiedBytes, tempSize)
-                            }
-                            read = input.read(buffer)
-                        }
-                        output.flush()
-                    }
-                }
-                // SECURITY: Secure wipe temp file after copy
-                vaultEngine.secureWipeFile(tempFile.absolutePath)
-            }
-            // If renamed, temp file no longer exists, no need to wipe
-            
-            // Emit final progress with actual size
-            val finalSize = vaultFile.length()
+            imported = true
+            val finalSize = metadata.sizeBytes
             emitProgress(finalSize, finalSize, complete = true)
             
-            SecureLog.d("VaultPlugin", "importVaultFileFromUri: success, vaultId=$vaultId, size=$finalSize, renamed=$renamed")
-            
-            val metadata = vaultRegistry.getVault(vaultId)
+            SecureLog.d("VaultPlugin", "importVaultFileFromUri: success, vaultId=${metadata.id}, size=$finalSize")
             mutableMapOf<String, Any>(
-                "id" to vaultId,
-                "filename" to (metadata?.filename ?: ""),
-                "createdAt" to (metadata?.createdAt ?: System.currentTimeMillis()),
+                "id" to metadata.id,
+                "filename" to metadata.filename,
+                "createdAt" to metadata.createdAt,
                 "sizeBytes" to finalSize
             ).apply { putAll(kdfInfo) }
         } catch (e: Exception) {
             SecureLog.e("VaultPlugin", "Import vault file failed")
+            if (e is CancellationException) {
+                if (!imported) runCatching { vaultEngine.secureWipeFile(tempFile.absolutePath) }
+                throw e
+            }
             // SECURITY: Clean up temp file on exception
-            try {
-                vaultEngine.secureWipeFile(tempFile.absolutePath)
-            } catch (_: Exception) {}
+            if (!imported) runCatching { vaultEngine.secureWipeFile(tempFile.absolutePath) }
             emitProgress(bytesCopied, totalBytes, err = "Import failed")
             null
         }
@@ -1906,12 +1995,12 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         val vaultEngine = VaultEngine.getInstance(ctx)
         val totalBytes = safFileHandler.getFileSize(uri)
         var bytesCopied = 0L
-        var lastPercent = -1
         
         if (!securityManager.isEnvironmentSecure()) return null
         
         // SECURITY: Declare tempFile outside try for cleanup in catch
-        val tempFile = File(ctx.cacheDir, "vault_import_${System.currentTimeMillis()}.tmp")
+        val tempFile = vaultRegistry.createImportTempFile()
+        var imported = false
         
         // Helper to emit progress on main thread
         suspend fun emitProgress(bytes: Long, total: Long, complete: Boolean = false, err: String? = null) {
@@ -1922,67 +2011,33 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         
         return try {
             emitProgress(bytesCopied, totalBytes)
-            // Copy to temp file first
-            ctx.contentResolver.openInputStream(uri)?.use { input ->
-                tempFile.outputStream().use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    var read = input.read(buffer)
-                    var lastEmitTime = System.currentTimeMillis()
-                    while (read > 0) {
-                        output.write(buffer, 0, read)
-                        bytesCopied += read.toLong()
-                        if (totalBytes > 0) {
-                            val percent = ((bytesCopied * 100) / totalBytes).toInt()
-                            if (percent != lastPercent) {
-                                lastPercent = percent
-                                emitProgress(bytesCopied, totalBytes)
-                            }
-                        } else {
-                            // Unknown total size - emit progress every 500ms
-                            val now = System.currentTimeMillis()
-                            if (now - lastEmitTime > 500) {
-                                lastEmitTime = now
-                                emitProgress(bytesCopied, bytesCopied)
-                            }
-                        }
-                        read = input.read(buffer)
-                    }
-                    output.flush()
-                }
-            } ?: return null
-            
-            // Validate vault magic
-            val ok = hasSupportedVaultMagic(tempFile)
-            if (!ok) {
-                // SECURITY: Secure wipe temp file before deletion
-                vaultEngine.secureWipeFile(tempFile.absolutePath)
-                return null
+            bytesCopied = copyUriToFileWithSpaceReserve(uri, tempFile, totalBytes) { copied, total ->
+                emitProgress(copied, total)
             }
             
             // Add to registry
             val metadata = vaultRegistry.addImportedVault(tempFile.absolutePath)
-            // SECURITY: Secure wipe temp file after import
-            vaultEngine.secureWipeFile(tempFile.absolutePath)
-            
-            // Emit final progress with actual size
-            val finalSize = metadata?.sizeBytes ?: tempFile.length()
-            emitProgress(finalSize, finalSize, complete = true)
-            
-            if (metadata != null) {
-                mapOf(
-                    "id" to metadata.id,
-                    "filename" to metadata.filename,
-                    "createdAt" to metadata.createdAt,
-                    "sizeBytes" to metadata.sizeBytes
-                )
-            } else {
-                null
+            if (metadata == null) {
+                vaultEngine.secureWipeFile(tempFile.absolutePath)
+                return null
             }
+            imported = true
+            // Emit final progress with actual size
+            val finalSize = metadata.sizeBytes
+            emitProgress(finalSize, finalSize, complete = true)
+            mapOf(
+                "id" to metadata.id,
+                "filename" to metadata.filename,
+                "createdAt" to metadata.createdAt,
+                "sizeBytes" to metadata.sizeBytes
+            )
         } catch (e: Exception) {
             // SECURITY: Clean up temp file on exception
-            try {
-                vaultEngine.secureWipeFile(tempFile.absolutePath)
-            } catch (_: Exception) {}
+            if (e is CancellationException) {
+                if (!imported) runCatching { vaultEngine.secureWipeFile(tempFile.absolutePath) }
+                throw e
+            }
+            if (!imported) runCatching { vaultEngine.secureWipeFile(tempFile.absolutePath) }
             emitProgress(bytesCopied, totalBytes, err = "Import failed")
             null
         }
@@ -2302,6 +2357,10 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             result.error("NO_VAULT", "No vault to export (path: $vaultPath)", null)
             return
         }
+        vaultExportError(vaultPath)?.let { (code, message) ->
+            result.error(code, message, null)
+            return
+        }
         
         // Store path for use in copyVaultToUri
         pendingExportVaultPath = vaultPath
@@ -2339,36 +2398,67 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
     private suspend fun copyVaultToUri(uri: Uri): Boolean {
         val ctx = activity ?: return false
         // Use pendingExportVaultPath if set (multi-vault), otherwise default vault
-        val vaultPath = pendingExportVaultPath ?: VaultEngine.getInstance(ctx).getVaultPath()
+        val vaultEngine = VaultEngine.getInstance(ctx)
+        val vaultPath = pendingExportVaultPath ?: vaultEngine.getVaultPath()
         pendingExportVaultPath = null
-        val totalBytes = File(vaultPath).length()
+        val exportToken = withContext(Dispatchers.IO) {
+            vaultEngine.beginVaultExport(vaultPath).getOrNull()
+        } ?: return false
+        val totalBytes = exportToken[1]
         var bytesCopied = 0L
         var lastPercent = -1
 
         return try {
             emitTransferProgress("export_vault", bytesCopied, totalBytes)
-            FileInputStream(File(vaultPath)).use { input ->
-                ctx.contentResolver.openOutputStream(uri)?.use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    var read = input.read(buffer)
-                    while (read > 0) {
-                        output.write(buffer, 0, read)
-                        bytesCopied += read.toLong()
-                        if (totalBytes > 0) {
-                            val percent = ((bytesCopied * 100) / totalBytes).toInt()
-                            if (percent != lastPercent) {
-                                lastPercent = percent
-                                emitTransferProgress("export_vault", bytesCopied, totalBytes)
+            val copied = withContext(Dispatchers.IO) {
+                FileInputStream(File(vaultPath)).use { input ->
+                    ctx.contentResolver.openOutputStream(uri)?.use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        var read = input.read(buffer)
+                        while (read > 0) {
+                            output.write(buffer, 0, read)
+                            bytesCopied += read.toLong()
+                            if (totalBytes > 0) {
+                                val percent = ((bytesCopied * 100) / totalBytes).toInt()
+                                if (percent != lastPercent) {
+                                    lastPercent = percent
+                                    withContext(Dispatchers.Main) {
+                                        emitTransferProgress(
+                                            "export_vault",
+                                            bytesCopied,
+                                            totalBytes
+                                        )
+                                    }
+                                }
                             }
+                            read = input.read(buffer)
                         }
-                        read = input.read(buffer)
-                    }
-                    output.flush()
-                    emitTransferProgress("export_vault", totalBytes, totalBytes, isComplete = true)
-                    true
-                } ?: false
+                        output.flush()
+                        true
+                    } ?: false
+                }
             }
+            val valid = copied && withContext(Dispatchers.IO) {
+                vaultEngine.isVaultExportCurrent(vaultPath, exportToken)
+            }
+            if (!valid) {
+                withContext(Dispatchers.IO) {
+                    runCatching { DocumentsContract.deleteDocument(ctx.contentResolver, uri) }
+                }
+                emitTransferProgress(
+                    "export_vault",
+                    bytesCopied,
+                    totalBytes,
+                    error = "Vault changed during export"
+                )
+                return false
+            }
+            emitTransferProgress("export_vault", totalBytes, totalBytes, isComplete = true)
+            true
         } catch (e: Exception) {
+            withContext(Dispatchers.IO) {
+                runCatching { DocumentsContract.deleteDocument(ctx.contentResolver, uri) }
+            }
             emitTransferProgress("export_vault", bytesCopied, totalBytes, error = "Export failed")
             false
         }
@@ -2380,7 +2470,6 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
         val vaultPath = vaultEngine.getVaultPath()
         val totalBytes = safFileHandler.getFileSize(uri)
         var bytesCopied = 0L
-        var lastPercent = -1
 
         if (!securityManager.isEnvironmentSecure()) return false
 
@@ -2391,41 +2480,21 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             // Close current vault before replacing
             vaultBridge.closeVault()
             emitTransferProgress("import_vault", bytesCopied, totalBytes)
-            ctx.contentResolver.openInputStream(uri)?.use { input ->
-                tempFile.outputStream().use { output ->
-                    val buffer = ByteArray(64 * 1024)
-                    var read = input.read(buffer)
-                    while (read > 0) {
-                        output.write(buffer, 0, read)
-                        bytesCopied += read.toLong()
-                        if (totalBytes > 0) {
-                            val percent = ((bytesCopied * 100) / totalBytes).toInt()
-                            if (percent != lastPercent) {
-                                lastPercent = percent
-                                emitTransferProgress("import_vault", bytesCopied, totalBytes)
-                            }
-                        }
-                        read = input.read(buffer)
-                    }
-                    output.flush()
-                }
-            } ?: return false
-
-            // Minimal magic check
-            val ok = hasSupportedVaultMagic(tempFile)
-            if (!ok) {
-                // SECURITY: Secure wipe temp file before deletion
-                vaultEngine.secureWipeFile(tempFile.absolutePath)
-                return false
+            bytesCopied = copyUriToFileWithSpaceReserve(uri, tempFile, totalBytes) { copied, total ->
+                emitTransferProgress("import_vault", copied, total)
             }
 
-            if (!tempFile.renameTo(destFile)) {
+            if (!vaultEngine.replaceVaultFile(tempFile, destFile)) {
                 vaultEngine.secureWipeFile(tempFile.absolutePath)
                 return false
             }
             emitTransferProgress("import_vault", totalBytes, totalBytes, isComplete = true)
             true
         } catch (e: Exception) {
+            if (e is CancellationException) {
+                runCatching { vaultEngine.secureWipeFile(tempFile.absolutePath) }
+                throw e
+            }
             // SECURITY: Clean up temp file on exception
             try {
                 vaultEngine.secureWipeFile(tempFile.absolutePath)
@@ -2457,6 +2526,18 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                 "error" to error
             )
         )
+    }
+
+    private fun vaultExportError(path: String): Pair<String, String>? {
+        val ctx = activity ?: return "NO_ACTIVITY" to "No activity available"
+        val info = VaultEngine.getInstance(ctx).inspectVaultKdfInfo(path).getOrElse {
+            return "VAULT_INSPECTION_FAILED" to "Vault state could not be verified; export is blocked"
+        }
+        if (info["retirementPending"] == true) {
+            return "VAULT_CLEANUP_PENDING" to
+                "Vault credentials still need cleanup. Close and reopen the vault before exporting."
+        }
+        return null
     }
 
     private fun emitImportProgress(
@@ -2560,7 +2641,15 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
                         result.success(true)
                     },
                     onFailure = { error ->
-                        if (error is VaultException && error.isAuthError()) {
+                        if (error is VaultException &&
+                            error.errorCode == VaultEngine.VAULT_ERR_RETIREMENT_PENDING) {
+                            passwordRateLimiter.recordSuccess(limiterVaultId)
+                            result.error(
+                                "PASSWORD_CHANGED_CLEANUP_PENDING",
+                                "Password changed. Close and reopen the vault before exporting; old credentials still need cleanup.",
+                                null
+                            )
+                        } else if (error is VaultException && error.isAuthError()) {
                             reportAuthFailure(limiterVaultId, result)
                         } else {
                             reportVaultFailure(error, result, "CHANGE_FAILED")
@@ -3112,6 +3201,10 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
             result.error("ENV_BLOCKED", "Environment not supported", null)
             return
         }
+        vaultExportError(vaultPath)?.let { (code, message) ->
+            result.error(code, message, null)
+            return
+        }
 
         pendingExportVaultPath = vaultPath
         pendingExportResult = result
@@ -3125,4 +3218,21 @@ class VaultPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAwar
     }
 
     private var pendingExportVaultPath: String? = null
+}
+
+private class BoundedPreviewOutputStream(private val maxSize: Int) : ByteArrayOutputStream() {
+    override fun write(value: Int) {
+        if (count >= maxSize) throw IOException("PDF preview output exceeds limit")
+        super.write(value)
+    }
+
+    override fun write(buffer: ByteArray, offset: Int, length: Int) {
+        if (length > maxSize - count) throw IOException("PDF preview output exceeds limit")
+        super.write(buffer, offset, length)
+    }
+
+    override fun close() {
+        buf.fill(0)
+        super.close()
+    }
 }

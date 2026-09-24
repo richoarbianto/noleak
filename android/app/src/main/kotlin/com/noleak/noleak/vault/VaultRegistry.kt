@@ -50,6 +50,8 @@ class VaultRegistry private constructor(private val context: Context) {
             return dir
         }
 
+    fun createImportTempFile(): File = File(vaultDir, ".import_${UUID.randomUUID()}.tmp")
+
     private fun listVaultsFromDisk(): List<VaultMetadata> {
         val files = vaultDir.listFiles { file ->
             file.isFile && file.name.endsWith(".dat", ignoreCase = true)
@@ -316,12 +318,17 @@ class VaultRegistry private constructor(private val context: Context) {
         if (!vaultFile.exists()) return null
         
         // Move/copy to vault directory if not already there
-        val targetFile = if (vaultFile.parent == vaultDir.absolutePath) {
+        val targetFile = if (vaultFile.parent == vaultDir.absolutePath &&
+            vaultFile.extension.equals("dat", ignoreCase = true)) {
             vaultFile
         } else {
             val filename = nextVaultFilename()
             val target = File(vaultDir, filename)
-            vaultFile.copyTo(target, overwrite = true)
+            if (vaultFile.parent == vaultDir.absolutePath) {
+                if (!vaultFile.renameTo(target)) return null
+            } else {
+                vaultFile.copyTo(target, overwrite = false)
+            }
             target
         }
         

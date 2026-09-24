@@ -162,13 +162,20 @@ int vault_aead_encrypt(const uint8_t key[VAULT_KEY_LEN], const uint8_t *nonce,
 int vault_aead_decrypt(const uint8_t key[VAULT_KEY_LEN],
                        const uint8_t nonce[VAULT_NONCE_LEN], const uint8_t *aad,
                        size_t aad_len, const uint8_t *ciphertext, size_t ct_len,
-                       uint8_t *plaintext, size_t *pt_len_out) {
+                       uint8_t *plaintext, size_t plaintext_capacity,
+                       size_t *pt_len_out) {
   if (!key || !nonce || !ciphertext || !plaintext || !pt_len_out) {
     return VAULT_ERR_INVALID_PARAM;
   }
 
   if (ct_len < VAULT_TAG_LEN) {
     LOGE("Ciphertext too short");
+    return VAULT_ERR_INVALID_PARAM;
+  }
+
+  *pt_len_out = 0;
+  if (ct_len - VAULT_TAG_LEN > plaintext_capacity) {
+    LOGE("Plaintext output buffer too small");
     return VAULT_ERR_INVALID_PARAM;
   }
 
@@ -180,8 +187,14 @@ int vault_aead_decrypt(const uint8_t key[VAULT_KEY_LEN],
       ciphertext, ct_len, aad, aad_len, nonce, key);
 
   if (result != 0) {
+    vault_zeroize(plaintext, plaintext_capacity);
     LOGE("AEAD decryption failed - authentication error");
     return VAULT_ERR_AUTH_FAIL;
+  }
+
+  if (plaintext_len > plaintext_capacity) {
+    vault_zeroize(plaintext, plaintext_capacity);
+    return VAULT_ERR_CORRUPTED;
   }
 
   *pt_len_out = (size_t)plaintext_len;

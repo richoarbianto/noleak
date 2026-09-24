@@ -489,9 +489,13 @@ static int validate_kdf_params(uint32_t mem_limit, uint32_t iterations,
 }
 
 int vault_inspect_kdf_params(const char *path, uint32_t *mem_out,
-                             uint32_t *iter_out, uint32_t *parallel_out) {
-  if (!path || !mem_out || !iter_out || !parallel_out)
+                             uint32_t *iter_out, uint32_t *parallel_out,
+                             int *retirement_pending_out) {
+  if (!path || !mem_out || !iter_out || !parallel_out ||
+      !retirement_pending_out)
     return VAULT_ERR_INVALID_PARAM;
+
+  *retirement_pending_out = 0;
 
   int fd = open(path, O_RDONLY);
   if (fd < 0)
@@ -530,9 +534,22 @@ int vault_inspect_kdf_params(const char *path, uint32_t *mem_out,
       parallelism = slot.kdf_parallel;
     } else {
       vault_log_slot_t slot;
-      result = log_select_slot(fd, &super, (uint64_t)st.st_size, &slot, NULL);
+      uint32_t slot_index = 0;
+      result = log_select_slot(fd, &super, (uint64_t)st.st_size, &slot,
+                               &slot_index);
       if (result != VAULT_OK)
         goto cleanup;
+      vault_log_slot_t mirror;
+      uint32_t mirror_index = (slot_index + 1) % VAULT_LOG_SLOT_COUNT;
+      *retirement_pending_out =
+          log_read_slot(fd, &super, mirror_index, (uint64_t)st.st_size,
+                        &mirror) != VAULT_OK ||
+          memcmp(&mirror, &slot, sizeof(slot)) != 0;
+      if (g_vault.is_open && g_vault.path &&
+          strcmp(g_vault.path, path) == 0 &&
+          g_vault.root_retirement_pending) {
+        *retirement_pending_out = 1;
+      }
       memory = slot.kdf_mem;
       iterations = slot.kdf_iter;
       parallelism = slot.kdf_parallel;
@@ -908,20 +925,19 @@ static int deserialize_index(const uint8_t *data, size_t len,
     memcpy(&entry->wrapped_dek_len, data + offset, sizeof(uint16_t));
     offset += sizeof(uint16_t);
 
-    if (entry->wrapped_dek_len > 0) {
-      if (offset + entry->wrapped_dek_len > len ||
-          entry->wrapped_dek_len > 512) {
-        free_entries_array(entries, i + 1);
-        return VAULT_ERR_CORRUPTED;
-      }
-      entry->wrapped_dek = malloc(entry->wrapped_dek_len);
-      if (!entry->wrapped_dek) {
-        free_entries_array(entries, i + 1);
-        return VAULT_ERR_MEMORY;
-      }
-      memcpy(entry->wrapped_dek, data + offset, entry->wrapped_dek_len);
-      offset += entry->wrapped_dek_len;
+    if (entry->wrapped_dek_len !=
+            VAULT_NONCE_LEN + VAULT_KEY_LEN + VAULT_TAG_LEN ||
+        offset + entry->wrapped_dek_len > len) {
+      free_entries_array(entries, i + 1);
+      return VAULT_ERR_CORRUPTED;
     }
+    entry->wrapped_dek = malloc(entry->wrapped_dek_len);
+    if (!entry->wrapped_dek) {
+      free_entries_array(entries, i + 1);
+      return VAULT_ERR_MEMORY;
+    }
+    memcpy(entry->wrapped_dek, data + offset, entry->wrapped_dek_len);
+    offset += entry->wrapped_dek_len;
 
     // FIX: Read chunk_count first (always present in new format)
     // Then decide whether to read chunk data or offset/length based on its
@@ -1013,7 +1029,7 @@ static int log_unwrap_index_key(
   int result = vault_aead_decrypt(
       master_key, wrapped_index_key, (const uint8_t *)&aad, sizeof(aad),
       wrapped_index_key + VAULT_NONCE_LEN, VAULT_KEY_LEN + VAULT_TAG_LEN,
-      index_key, &index_key_len);
+      index_key, VAULT_KEY_LEN, &index_key_len);
   if (result != VAULT_OK || index_key_len != VAULT_KEY_LEN) {
     vault_zeroize(index_key, VAULT_KEY_LEN);
     return result == VAULT_OK ? VAULT_ERR_CORRUPTED : result;
@@ -1109,7 +1125,7 @@ static int read_log_index(int fd, const vault_log_slot_t *slot,
   result = vault_aead_decrypt(
       index_key, record, (const uint8_t *)&aad, sizeof(aad),
       record + VAULT_NONCE_LEN + sizeof(uint64_t), (size_t)ciphertext_len,
-      plaintext, &actual_len);
+      plaintext, plaintext_len, &actual_len);
   if (result == VAULT_OK) {
     vault_entry_t *entries = NULL;
     uint32_t count = 0;
@@ -1439,7 +1455,8 @@ static int open_log_container(int fd, uint64_t file_size, const char *path,
     result = vault_aead_decrypt(
         kek, legacy_slot.wrapped_mk, legacy_slot.vault_id, VAULT_ID_LEN,
         legacy_slot.wrapped_mk + VAULT_NONCE_LEN,
-        VAULT_KEY_LEN + VAULT_TAG_LEN, g_vault.master_key, &master_key_len);
+        VAULT_KEY_LEN + VAULT_TAG_LEN, g_vault.master_key, VAULT_KEY_LEN,
+        &master_key_len);
     if (result != VAULT_OK || master_key_len != VAULT_KEY_LEN) {
       result = VAULT_ERR_AUTH_FAIL;
       goto cleanup;
@@ -1511,7 +1528,7 @@ static int open_log_container(int fd, uint64_t file_size, const char *path,
   result = vault_aead_decrypt(
       kek, slot.wrapped_mk, slot.vault_id, VAULT_ID_LEN,
       slot.wrapped_mk + VAULT_NONCE_LEN, VAULT_KEY_LEN + VAULT_TAG_LEN,
-      g_vault.master_key, &master_key_len);
+      g_vault.master_key, VAULT_KEY_LEN, &master_key_len);
   if (result != VAULT_OK || master_key_len != VAULT_KEY_LEN) {
     result = VAULT_ERR_AUTH_FAIL;
     goto cleanup;
@@ -1579,6 +1596,7 @@ static int open_log_container(int fd, uint64_t file_size, const char *path,
       goto cleanup;
   }
 
+  g_vault.root_retirement_pending = 0;
   g_vault.is_open = 1;
   log_refresh_metrics();
 
@@ -1782,7 +1800,8 @@ int vault_open(const char *path, const uint8_t *passphrase, size_t pass_len) {
 
   result = vault_aead_decrypt(kek, nonce, header_vault_id,
                               VAULT_ID_LEN, // AAD = vault_id
-                              ciphertext, ct_len, g_vault.master_key, &pt_len);
+                              ciphertext, ct_len, g_vault.master_key,
+                              VAULT_KEY_LEN, &pt_len);
 
   if (result != VAULT_OK) {
     LOGE("Failed to unwrap master key - wrong passphrase?");
@@ -2291,7 +2310,8 @@ static int read_index(int fd, const uint8_t mk[VAULT_KEY_LEN]) {
   size_t actual_pt_len;
   int result =
       vault_aead_decrypt(mk, nonce, NULL, 0, // No AAD for index
-                         ciphertext, ct_len, plaintext, &actual_pt_len);
+                         ciphertext, ct_len, plaintext, pt_len,
+                         &actual_pt_len);
 
   free(ciphertext);
 
@@ -2620,6 +2640,7 @@ static int log_commit_index_with_credentials(
   size_t index_record_len = 0;
   uint8_t index_key[VAULT_KEY_LEN] = {0};
   uint8_t wrapped_index_key[WRAPPED_INDEX_KEY_SIZE] = {0};
+  int retirement_pending = 0;
   uint64_t sequence = g_vault.commit_sequence + 1;
 
   vault_random_bytes(index_key, sizeof(index_key));
@@ -2673,7 +2694,9 @@ static int log_commit_index_with_credentials(
   int mirror_result = log_write_slot(fd, g_vault.active_root_slot, &root);
   if (mirror_result != VAULT_OK || fsync(fd) != 0) {
     LOGE("log_commit_index: failed to mirror committed root slot");
+    retirement_pending = 1;
   }
+  g_vault.root_retirement_pending = retirement_pending;
 
   memcpy(g_vault.salt, salt, VAULT_SALT_LEN);
   memcpy(g_vault.wrapped_mk, wrapped_mk, WRAPPED_MK_SIZE);
@@ -2687,6 +2710,7 @@ static int log_commit_index_with_credentials(
   g_vault.index_length = index_record_len;
   g_vault.active_root_slot = next_slot;
   log_refresh_metrics();
+  result = retirement_pending ? VAULT_ERR_RETIREMENT_PENDING : VAULT_OK;
 
 cleanup:
   if (fd >= 0)
@@ -2718,7 +2742,8 @@ int vault_verify_password(const uint8_t *passphrase, size_t pass_len) {
     result = vault_aead_decrypt(
         kek, g_vault.wrapped_mk, g_vault.vault_id, VAULT_ID_LEN,
         g_vault.wrapped_mk + VAULT_NONCE_LEN,
-        VAULT_KEY_LEN + VAULT_TAG_LEN, candidate_mk, &candidate_len);
+        VAULT_KEY_LEN + VAULT_TAG_LEN, candidate_mk, VAULT_KEY_LEN,
+        &candidate_len);
     if (result != VAULT_OK || candidate_len != VAULT_KEY_LEN) {
       result = VAULT_ERR_AUTH_FAIL;
     }
@@ -2785,7 +2810,7 @@ int vault_change_password(const uint8_t *old_passphrase, size_t old_pass_len,
                               g_vault.vault_id, VAULT_ID_LEN, // AAD
                               g_vault.wrapped_mk + VAULT_NONCE_LEN,
                               VAULT_KEY_LEN + VAULT_TAG_LEN, // ciphertext
-                              decrypted_mk, &decrypted_len);
+                              decrypted_mk, VAULT_KEY_LEN, &decrypted_len);
 
   if (result != VAULT_OK) {
     LOGE("vault_change_password: Old password verification failed");
@@ -2832,7 +2857,7 @@ int vault_change_password(const uint8_t *old_passphrase, size_t old_pass_len,
   if (g_vault.container_format == VAULT_CONTAINER_LOG) {
     result = log_commit_index_with_credentials(
         new_salt, kdf_mem, kdf_iter, kdf_parallel, new_wrapped_mk);
-    if (result == VAULT_OK)
+    if (result == VAULT_OK || result == VAULT_ERR_RETIREMENT_PENDING)
       LOGI("vault_change_password: Password changed successfully");
     goto cleanup;
   }
@@ -3426,8 +3451,12 @@ static int log_append_entry(const vault_entry_t *new_entry,
   }
 
   int mirror_result = log_write_slot(fd, g_vault.active_root_slot, &root);
-  if (mirror_result != VAULT_OK || fsync(fd) != 0)
+  if (mirror_result != VAULT_OK || fsync(fd) != 0) {
     LOGE("log_append_entry: failed to mirror committed root slot");
+    g_vault.root_retirement_pending = 1;
+  } else {
+    g_vault.root_retirement_pending = 0;
+  }
 
   free_entries_array(g_vault.entries, g_vault.entry_count);
   g_vault.entries = entries;

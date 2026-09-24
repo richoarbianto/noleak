@@ -90,14 +90,6 @@ class VaultBridge private constructor(private val context: Context) {
         
         mutex.withLock {
             val result = vaultEngine.open(passphrase)
-            if (result.isSuccess) {
-                // SECURITY: Cleanup stale pending imports (older than 24 hours)
-                // These are encrypted chunks from interrupted imports
-                val cleaned = vaultEngine.streamingCleanupOld(24 * 60 * 60 * 1000L)
-                if (cleaned > 0) {
-                    SecureLog.i("VaultBridge", "Cleaned up $cleaned stale pending imports")
-                }
-            }
             result
         }
     }
@@ -107,7 +99,6 @@ class VaultBridge private constructor(private val context: Context) {
      */
     suspend fun closeVault() = withContext(Dispatchers.IO) {
         mutex.withLock {
-            vaultEngine.streamingCleanupOld(0)
             vaultEngine.close()
         }
     }

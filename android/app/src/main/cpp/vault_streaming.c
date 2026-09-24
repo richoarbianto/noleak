@@ -339,6 +339,12 @@ static int load_state(const uint8_t import_id[VAULT_ID_LEN],
     close(fd);
     return STREAMING_ERR_IO;
   }
+  if (state->wrapped_dek_len !=
+      VAULT_NONCE_LEN + VAULT_KEY_LEN + VAULT_TAG_LEN) {
+    streaming_free_state(state);
+    close(fd);
+    return STREAMING_ERR_CHUNK_CORRUPTED;
+  }
   if (state->wrapped_dek_len > 0) {
     state->wrapped_dek = malloc(state->wrapped_dek_len);
     if (!state->wrapped_dek ||
@@ -383,8 +389,10 @@ static int load_state(const uint8_t import_id[VAULT_ID_LEN],
 // Unwrap DEK from state
 static int unwrap_dek(const streaming_import_state_t *state,
                       uint8_t dek_out[VAULT_KEY_LEN]) {
+  vault_zeroize(dek_out, VAULT_KEY_LEN);
   if (!state->wrapped_dek ||
-      state->wrapped_dek_len < VAULT_NONCE_LEN + VAULT_TAG_LEN) {
+      state->wrapped_dek_len !=
+          VAULT_NONCE_LEN + VAULT_KEY_LEN + VAULT_TAG_LEN) {
     return STREAMING_ERR_CRYPTO;
   }
 
@@ -397,10 +405,16 @@ static int unwrap_dek(const streaming_import_state_t *state,
   uint8_t *nonce = state->wrapped_dek;
   uint8_t *ciphertext = state->wrapped_dek + VAULT_NONCE_LEN;
   size_t ct_len = state->wrapped_dek_len - VAULT_NONCE_LEN;
-  size_t pt_len;
+  size_t pt_len = 0;
 
-  return vault_aead_decrypt(g_vault.master_key, nonce, (uint8_t *)&aad,
-                            sizeof(aad), ciphertext, ct_len, dek_out, &pt_len);
+  int result = vault_aead_decrypt(g_vault.master_key, nonce, (uint8_t *)&aad,
+                                  sizeof(aad), ciphertext, ct_len, dek_out,
+                                  VAULT_KEY_LEN, &pt_len);
+  if (result == VAULT_OK && pt_len != VAULT_KEY_LEN) {
+    vault_zeroize(dek_out, VAULT_KEY_LEN);
+    return STREAMING_ERR_CRYPTO;
+  }
+  return result;
 }
 
 // ============================================================================

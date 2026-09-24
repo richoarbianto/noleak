@@ -108,6 +108,7 @@ static inline int vault_kdf_params_valid(uint32_t memory, uint32_t iterations,
 #define VAULT_ERR_ALREADY_EXISTS -8
 #define VAULT_ERR_NOT_OPEN -9
 #define VAULT_ERR_PASSPHRASE_TOO_SHORT -10
+#define VAULT_ERR_RETIREMENT_PENDING -11
 
 // Minimum passphrase length
 #define VAULT_MIN_PASSPHRASE_LEN 12
@@ -174,6 +175,7 @@ typedef struct {
   uint64_t index_offset;
   uint64_t index_length;
   uint32_t active_root_slot;
+  int root_retirement_pending;
 } vault_state_t;
 
 // Payload holder for writing container data
@@ -274,14 +276,16 @@ int vault_aead_encrypt(const uint8_t key[VAULT_KEY_LEN], const uint8_t *nonce,
  * @param aad_len Length of AAD
  * @param ciphertext Input ciphertext (includes tag)
  * @param ct_len Length of ciphertext
- * @param plaintext Output buffer (must be ct_len - VAULT_TAG_LEN)
+ * @param plaintext Output buffer
+ * @param plaintext_capacity Size of output buffer
  * @param pt_len_out Output plaintext length
  * @return VAULT_OK on success, VAULT_ERR_AUTH_FAIL if authentication fails
  */
 int vault_aead_decrypt(const uint8_t key[VAULT_KEY_LEN],
                        const uint8_t nonce[VAULT_NONCE_LEN], const uint8_t *aad,
                        size_t aad_len, const uint8_t *ciphertext, size_t ct_len,
-                       uint8_t *plaintext, size_t *pt_len_out);
+                       uint8_t *plaintext, size_t plaintext_capacity,
+                       size_t *pt_len_out);
 
 /**
  * Securely zero memory
@@ -351,7 +355,8 @@ int vault_open(const char *path, const uint8_t *passphrase, size_t pass_len);
  * This does not derive a key or decrypt vault contents.
  */
 int vault_inspect_kdf_params(const char *path, uint32_t *mem_out,
-                             uint32_t *iter_out, uint32_t *parallel_out);
+                             uint32_t *iter_out, uint32_t *parallel_out,
+                             int *retirement_pending_out);
 
 /** Verify a passphrase against the currently open vault without changing state. */
 int vault_verify_password(const uint8_t *passphrase, size_t pass_len);

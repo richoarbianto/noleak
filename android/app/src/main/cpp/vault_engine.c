@@ -100,6 +100,7 @@ void vault_close(void) {
     g_vault.index_offset = 0;
     g_vault.index_length = 0;
     g_vault.active_root_slot = 0;
+    g_vault.root_retirement_pending = 0;
     g_vault.kdf_mem = 0;
     g_vault.kdf_iter = 0;
     g_vault.kdf_parallel = 0;

@@ -181,7 +181,8 @@ int vault_read_file(const uint8_t file_id[VAULT_ID_LEN], uint8_t **data_out,
 
   size_t pt_len = 0;
   result = vault_aead_decrypt(dek, nonce, (uint8_t *)&aad, sizeof(aad),
-                              ciphertext, ct_len, plaintext, &pt_len);
+                              ciphertext, ct_len, plaintext,
+                              ct_len - VAULT_TAG_LEN, &pt_len);
 
   vault_zeroize(dek, VAULT_KEY_LEN);
   vault_zeroize(blob, entry->data_length);
@@ -260,7 +261,8 @@ int vault_read_chunk(const uint8_t file_id[VAULT_ID_LEN], uint32_t chunk_idx,
   size_t pt_len = 0;
   result =
       vault_aead_decrypt(dek, entry->chunks[chunk_idx].nonce, (uint8_t *)&aad,
-                         sizeof(aad), ciphertext, length, plaintext, &pt_len);
+                         sizeof(aad), ciphertext, length, plaintext,
+                         length - VAULT_TAG_LEN, &pt_len);
 
   vault_zeroize(dek, VAULT_KEY_LEN);
   vault_zeroize(ciphertext, length);
@@ -330,7 +332,7 @@ int vault_delete_file(const uint8_t file_id[VAULT_ID_LEN]) {
 
   // Save only index section - doesn't load any payloads
   result = vault_save_index_only();
-  if (result != VAULT_OK) {
+  if (result != VAULT_OK && result != VAULT_ERR_RETIREMENT_PENDING) {
     LOGE("vault_delete_file: vault_save_index_only failed with %d", result);
     free_entries_array(g_vault.entries, g_vault.entry_count);
     g_vault.entries = backup_entries;
@@ -402,7 +404,7 @@ int vault_rename_file(const uint8_t file_id[VAULT_ID_LEN],
 
   // Save only index section - doesn't load any payloads
   result = vault_save_index_only();
-  if (result != VAULT_OK) {
+  if (result != VAULT_OK && result != VAULT_ERR_RETIREMENT_PENDING) {
     LOGE("vault_rename_file: vault_save_index_only failed with %d", result);
     free_entries_array(g_vault.entries, g_vault.entry_count);
     g_vault.entries = backup_entries;
@@ -748,8 +750,10 @@ error:
 
 static int unwrap_dek(const vault_entry_t *entry,
                       uint8_t dek_out[VAULT_KEY_LEN]) {
+  vault_zeroize(dek_out, VAULT_KEY_LEN);
   if (!entry || !entry->wrapped_dek ||
-      entry->wrapped_dek_len < VAULT_NONCE_LEN + VAULT_TAG_LEN) {
+      entry->wrapped_dek_len !=
+          VAULT_NONCE_LEN + VAULT_KEY_LEN + VAULT_TAG_LEN) {
     return VAULT_ERR_CORRUPTED;
   }
   vault_aad_t aad = {0};
@@ -763,8 +767,14 @@ static int unwrap_dek(const vault_entry_t *entry,
   size_t dek_ct_len = entry->wrapped_dek_len - VAULT_NONCE_LEN;
   size_t dek_len = 0;
 
-  return vault_aead_decrypt(g_vault.master_key, dek_nonce, (uint8_t *)&aad,
-                            sizeof(aad), dek_ct, dek_ct_len, dek_out, &dek_len);
+  int result = vault_aead_decrypt(g_vault.master_key, dek_nonce, (uint8_t *)&aad,
+                                  sizeof(aad), dek_ct, dek_ct_len, dek_out,
+                                  VAULT_KEY_LEN, &dek_len);
+  if (result == VAULT_OK && dek_len != VAULT_KEY_LEN) {
+    vault_zeroize(dek_out, VAULT_KEY_LEN);
+    return VAULT_ERR_CORRUPTED;
+  }
+  return result;
 }
 
 static int load_blob(uint64_t offset, uint64_t length, uint8_t **out) {

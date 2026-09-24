@@ -22,6 +22,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import '../models/vault_state.dart';
 import '../services/vault_state_manager.dart';
 import '../services/vault_channel.dart';
@@ -906,6 +907,16 @@ class _VaultHomeScreenState extends State<VaultHomeScreen> {
           backgroundColor: success
               ? CyberpunkTheme.neonGreen.withOpacity(0.9)
               : CyberpunkTheme.error,
+        ));
+      }
+    } on PlatformException catch (e) {
+      final message = e.code == 'PASSWORD_CHANGED_CLEANUP_PENDING'
+          ? 'Password changed, but vault cleanup is pending. Close and reopen the vault before exporting.'
+          : 'Failed to change password: $e';
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(message),
+          backgroundColor: CyberpunkTheme.error,
         ));
       }
     } catch (e) {
